@@ -9,6 +9,7 @@ import { dirname, join } from 'path';
 import fs from 'fs/promises';
 import dotenv from 'dotenv';
 import { generateJWT, getCMSBaseURL } from './lib/jwt.js';
+import { createBranch, getVercelPreviewURL, mergeBranch, deleteBranch } from './lib/github.js';
 
 dotenv.config();
 
@@ -244,6 +245,7 @@ app.get('/sites/:siteId/history', async (req, res) => {
 app.post('/sites/:siteId/preview', async (req, res) => {
   try {
     const { siteId } = req.params;
+    const { files = [] } = req.body; // Optional: specific files to include in preview
     
     // Get site
     const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
@@ -257,20 +259,26 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     // Create preview branch
     const branchName = `preview-${Date.now()}`;
     
-    // TODO: Git operations to create preview branch
-    // This will be implemented with local repo cloning
+    console.log(`Creating preview branch: ${branchName}`);
     
-    const previewUrl = `https://${site.domain}-${branchName}.vercel.app`;
+    await createBranch(site.github_repo, site.github_token, branchName);
+    
+    // Generate Vercel preview URL
+    // Format: https://{project}-git-{branch}.vercel.app
+    const previewUrl = getVercelPreviewURL(site.vercel_project, branchName);
+    
+    console.log(`Preview URL: ${previewUrl}`);
     
     // Save edit record
     await pool.query(
       'INSERT INTO edits (session_id, file_path, change_description, preview_url, preview_branch) VALUES ($1, $2, $3, $4, $5)',
-      [session.id, 'multiple', 'Preview deployment', previewUrl, branchName]
+      [session.id, files.join(', ') || 'AI changes', 'Preview deployment', previewUrl, branchName]
     );
     
     res.json({
       previewUrl,
-      branch: branchName
+      branch: branchName,
+      message: 'Preview branch created. Vercel will deploy automatically in ~30 seconds.'
     });
   } catch (error) {
     console.error('Preview error:', error);
@@ -293,8 +301,17 @@ app.post('/sites/:siteId/approve', async (req, res) => {
     if (siteResult.rows.length === 0) {
       return res.status(404).json({ error: 'Site not found' });
     }
+    const site = siteResult.rows[0];
     
-    // TODO: Merge preview branch to main
+    console.log(`Merging ${previewBranch} to main`);
+    
+    // Merge preview branch to main
+    await mergeBranch(
+      site.github_repo, 
+      site.github_token, 
+      previewBranch,
+      `Approve AI changes from ${previewBranch}`
+    );
     
     // Mark as approved
     await pool.query(
@@ -302,7 +319,22 @@ app.post('/sites/:siteId/approve', async (req, res) => {
       [previewBranch]
     );
     
-    res.json({ status: 'approved', message: 'Changes merged to production' });
+    console.log(`Merged to main. Cleaning up preview branch...`);
+    
+    // Clean up preview branch (optional - can keep for history)
+    try {
+      await deleteBranch(site.github_repo, site.github_token, previewBranch);
+      console.log(`Preview branch ${previewBranch} deleted`);
+    } catch (cleanupError) {
+      console.warn(`Could not delete preview branch: ${cleanupError.message}`);
+      // Non-fatal - continue
+    }
+    
+    res.json({ 
+      status: 'approved', 
+      message: 'Changes merged to production. Vercel will deploy to live site in ~30 seconds.',
+      productionUrl: `https://${site.vercel_project}.vercel.app`
+    });
   } catch (error) {
     console.error('Approve error:', error);
     res.status(500).json({ error: error.message });
