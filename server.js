@@ -272,6 +272,193 @@ app.get('/sites/:siteId/pages', async (req, res) => {
 });
 
 // ============================================================
+// Brand Guide Endpoints (Feature 1)
+// ============================================================
+
+// GET /sites/:siteId/brand - Get brand guide
+app.get('/sites/:siteId/brand', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const result = await pool.query('SELECT brand_guide FROM sites WHERE id = $1', [siteId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const brandGuide = result.rows[0].brand_guide || {};
+    res.json(brandGuide);
+  } catch (error) {
+    console.error('Get brand guide error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /sites/:siteId/brand - Update brand guide
+app.put('/sites/:siteId/brand', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const brandGuide = req.body;
+    
+    // Validate that it's a valid JSON object
+    if (!brandGuide || typeof brandGuide !== 'object') {
+      return res.status(400).json({ error: 'Brand guide must be a JSON object' });
+    }
+    
+    const result = await pool.query(
+      'UPDATE sites SET brand_guide = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+      [JSON.stringify(brandGuide), siteId]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    console.log(`Brand guide updated for site: ${siteId}`);
+    res.json({ success: true, brandGuide });
+  } catch (error) {
+    console.error('Update brand guide error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /sites/:siteId/brand/scan - Auto-generate brand guide from CSS/HTML
+app.post('/sites/:siteId/brand/scan', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const result = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const site = result.rows[0];
+    
+    if (!site.github_repo || !site.github_token) {
+      return res.status(400).json({ error: 'Site does not have GitHub configured' });
+    }
+    
+    const [owner, repoName] = site.github_repo.split('/');
+    const token = site.github_token;
+    
+    console.log(`Scanning site for brand info: ${siteId}`);
+    
+    // Scan CSS files for colors and patterns
+    const colors = { primary: '', secondary: '', accent: '', text: '', background: '' };
+    const fonts = { heading: '', body: '' };
+    let buttonStyle = '';
+    let layoutNotes = '';
+    const validPages = [];
+    
+    try {
+      // Get CSS files from dist/css/
+      const cssResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repoName}/contents/dist/css?ref=staging`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+      );
+      
+      if (cssResp.ok) {
+        const cssFiles = await cssResp.json();
+        
+        // Look for main CSS file (style.css, elementor.css, etc.)
+        const mainCss = cssFiles.find(f => f.name.includes('style') || f.name.includes('elementor') || f.name === 'main.css');
+        
+        if (mainCss) {
+          const cssContentResp = await fetch(mainCss.download_url);
+          const cssContent = await cssContentResp.text();
+          
+          // Extract colors (look for hex codes in CSS)
+          const hexPattern = /#[0-9A-Fa-f]{6}/g;
+          const foundColors = [...new Set(cssContent.match(hexPattern) || [])].slice(0, 10);
+          
+          if (foundColors.length >= 3) {
+            colors.primary = foundColors[0];
+            colors.secondary = foundColors[1];
+            colors.accent = foundColors[2];
+          }
+          colors.text = '#333333';
+          colors.background = '#FFFFFF';
+          
+          // Extract fonts
+          const fontPattern = /font-family:\s*([^;]+);/gi;
+          const fontMatches = cssContent.match(fontPattern) || [];
+          if (fontMatches.length > 0) {
+            const firstFont = fontMatches[0].replace('font-family:', '').replace(';', '').trim();
+            fonts.heading = firstFont;
+            fonts.body = fontMatches[1] ? fontMatches[1].replace('font-family:', '').replace(';', '').trim() : firstFont;
+          }
+          
+          // Detect button patterns
+          if (cssContent.includes('border-radius')) {
+            buttonStyle = 'Rounded corners';
+          }
+          if (cssContent.includes('.btn') || cssContent.includes('button')) {
+            buttonStyle += buttonStyle ? ', uses .btn classes' : 'Uses .btn classes';
+          }
+        }
+      }
+      
+      // Get index.html to understand layout
+      const indexResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repoName}/contents/dist/index.html?ref=staging`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+      );
+      
+      if (indexResp.ok) {
+        const indexData = await indexResp.json();
+        const indexContent = Buffer.from(indexData.content, 'base64').toString('utf-8');
+        
+        // Detect layout framework
+        if (indexContent.includes('elementor')) {
+          layoutNotes = 'Built with Elementor page builder';
+        } else if (indexContent.includes('bootstrap')) {
+          layoutNotes = 'Uses Bootstrap framework';
+        } else {
+          layoutNotes = 'Custom layout';
+        }
+      }
+      
+      // Get list of valid pages
+      const pagesResp = await fetch(
+        `https://api.github.com/repos/${owner}/${repoName}/contents/dist?ref=staging`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+      );
+      
+      if (pagesResp.ok) {
+        const items = await pagesResp.json();
+        validPages.push('/'); // Homepage always exists
+        
+        for (const item of items) {
+          if (item.type === 'dir' && item.name !== 'css' && item.name !== 'js' && item.name !== 'images' && item.name !== 'uploads') {
+            validPages.push(`/${item.name}/`);
+          }
+        }
+      }
+      
+    } catch (scanError) {
+      console.warn('Error during brand scan:', scanError.message);
+    }
+    
+    // Build brand guide object
+    const scannedBrandGuide = {
+      colors,
+      fonts,
+      button_style: buttonStyle || 'Not detected',
+      layout_notes: layoutNotes || 'Not detected',
+      valid_pages: validPages.length > 0 ? validPages : ['/']
+    };
+    
+    // Save to database
+    await pool.query(
+      'UPDATE sites SET brand_guide = $1, updated_at = NOW() WHERE id = $2',
+      [JSON.stringify(scannedBrandGuide), siteId]
+    );
+    
+    console.log(`Brand guide scanned and saved for ${siteId}:`, scannedBrandGuide);
+    res.json({ success: true, brandGuide: scannedBrandGuide });
+    
+  } catch (error) {
+    console.error('Brand scan error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
 
 // Get or create session
 async function getSession(siteId) {
@@ -314,8 +501,45 @@ async function saveMessage(sessionId, role, content) {
 // Build system prompt
 function buildSystemPrompt(site, cmsApiUrl, jwtToken) {
   const basePrompt = site.config?.systemPrompt || '';
+  const brandGuide = site.brand_guide || {};
+  
+  // Format brand guide for system prompt
+  let brandSection = '';
+  if (brandGuide && Object.keys(brandGuide).length > 0) {
+    brandSection = `
+
+## BRAND GUIDE (ALWAYS FOLLOW THESE GUIDELINES)
+
+This site's brand guide is cached in the database. Use these values for ALL design decisions:
+
+**Colors:**
+${brandGuide.colors ? `
+- Primary: ${brandGuide.colors.primary || 'Not set'}
+- Secondary: ${brandGuide.colors.secondary || 'Not set'}
+- Accent: ${brandGuide.colors.accent || 'Not set'}
+- Text: ${brandGuide.colors.text || 'Not set'}
+- Background: ${brandGuide.colors.background || 'Not set'}` : 'Not configured'}
+
+**Typography:**
+${brandGuide.fonts ? `
+- Headings: ${brandGuide.fonts.heading || 'Not set'}
+- Body: ${brandGuide.fonts.body || 'Not set'}` : 'Not configured'}
+
+**Button Style:** ${brandGuide.button_style || 'Not documented'}
+
+**Layout Notes:** ${brandGuide.layout_notes || 'Not documented'}
+
+**Valid Pages (for link verification):**
+${brandGuide.valid_pages && brandGuide.valid_pages.length > 0 ? brandGuide.valid_pages.join(', ') : 'Use verify_links tool to check'}
+
+**IMPORTANT:** When creating or editing content, ALWAYS use these brand colors, fonts, and styling patterns. Never invent new colors or styles.
+`;
+  }
   
   return `You are the Site Editor AI for ${site.domain}.
+
+${basePrompt}
+${brandSection}
 
 ${basePrompt}
 
@@ -808,15 +1032,25 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'verify_links') {
-        // List top-level directories in dist/ to check which pages exist
-        const resp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/dist?ref=staging`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        if (!resp.ok) return 'Error checking links.';
-        const items = await resp.json();
-        const existingPaths = items.filter(i => i.type === 'dir').map(i => '/' + i.name + '/');
-        existingPaths.push('/'); // Homepage always exists
+        // Use cached valid_pages from brand guide if available (more efficient)
+        const brandGuide = site.brand_guide || {};
+        let existingPaths = [];
+        
+        if (brandGuide.valid_pages && brandGuide.valid_pages.length > 0) {
+          existingPaths = brandGuide.valid_pages;
+          console.log(`[verify_links] Using cached valid_pages from brand guide (${existingPaths.length} pages)`);
+        } else {
+          // Fallback to GitHub API if brand guide not populated
+          console.log('[verify_links] Brand guide not available, fetching from GitHub API');
+          const resp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/dist?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          if (!resp.ok) return 'Error checking links.';
+          const items = await resp.json();
+          existingPaths = items.filter(i => i.type === 'dir').map(i => '/' + i.name + '/');
+          existingPaths.push('/'); // Homepage always exists
+        }
         
         const results = toolInput.paths.map(path => {
           const normalized = path.endsWith('/') ? path : path + '/';
@@ -1180,10 +1414,11 @@ const upload = multer({
   }
 });
 
-// POST /sites/:siteId/upload - Upload a file to shared storage
+// POST /sites/:siteId/upload - Upload a file to shared storage (with contextual classification)
 app.post('/sites/:siteId/upload', upload.single('file'), async (req, res) => {
   try {
     const { siteId } = req.params;
+    const { context = 'media', chat_session_id } = req.body; // context: "chat" or "media"
     
     if (!req.file) {
       return res.status(400).json({ error: 'No file provided' });
@@ -1200,16 +1435,82 @@ app.post('/sites/:siteId/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Site does not have GitHub repository configured' });
     }
     
-    // Use abstracted storage layer (swappable for Google Drive)
-    const result = await uploadFileToStorage(site, siteId, req.file);
-    
-    res.json({
-      success: true,
-      ...result
-    });
+    // Feature 3: Contextual classification
+    if (context === 'chat') {
+      // Chat context: Store temporarily, don't commit to GitHub
+      console.log(`Upload in chat context (session: ${chat_session_id})`);
+      
+      // Store file in database as base64 or generate a temporary storage key
+      const base64Content = req.file.buffer.toString('base64');
+      
+      const insertResult = await pool.query(
+        `INSERT INTO chat_attachments 
+         (session_id, site_id, filename, mimetype, size, storage_key, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days')
+         RETURNING id`,
+        [chat_session_id, siteId, req.file.originalname, req.file.mimetype, req.file.size, base64Content]
+      );
+      
+      const attachmentId = insertResult.rows[0].id;
+      
+      // Return a reference URL the AI can understand
+      res.json({
+        success: true,
+        context: 'chat',
+        attachmentId,
+        filename: req.file.originalname,
+        type: req.file.mimetype,
+        size: req.file.size,
+        url: `/api/chat-attachments/${attachmentId}`,
+        referenceUrl: `/api/chat-attachments/${attachmentId}`,
+        message: 'File stored temporarily for chat reference (expires in 30 days)'
+      });
+      
+    } else {
+      // Media context: Commit to GitHub repo (permanent)
+      console.log(`Upload in media context - committing to GitHub`);
+      
+      // Use abstracted storage layer (commits to GitHub)
+      const result = await uploadFileToStorage(site, siteId, req.file);
+      
+      res.json({
+        success: true,
+        context: 'media',
+        ...result
+      });
+    }
     
   } catch (error) {
     console.error('Upload error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/chat-attachments/:attachmentId - Retrieve a chat attachment
+app.get('/api/chat-attachments/:attachmentId', async (req, res) => {
+  try {
+    const { attachmentId } = req.params;
+    
+    const result = await pool.query(
+      'SELECT * FROM chat_attachments WHERE id = $1 AND (expires_at IS NULL OR expires_at > NOW())',
+      [attachmentId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Attachment not found or expired' });
+    }
+    
+    const attachment = result.rows[0];
+    
+    // Decode base64 content and send as file
+    const buffer = Buffer.from(attachment.storage_key, 'base64');
+    
+    res.setHeader('Content-Type', attachment.mimetype);
+    res.setHeader('Content-Disposition', `inline; filename="${attachment.filename}"`);
+    res.send(buffer);
+    
+  } catch (error) {
+    console.error('Get attachment error:', error);
     res.status(500).json({ error: error.message });
   }
 });
