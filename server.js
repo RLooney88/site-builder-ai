@@ -29,18 +29,31 @@ async function uploadFileToStorage(site, siteId, file) {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const uploadPath = `dist/uploads/${siteId}/${year}/${month}/${file.originalname}`;
   
-  // Convert file buffer to base64
-  const fileContent = file.buffer.toString('base64');
+  // Commit file to GitHub staging branch (direct API to avoid double-base64)
+  const [owner, repoName] = site.github_repo.split('/');
+  const fileBase64 = file.buffer.toString('base64');
   
-  // Commit file to GitHub staging branch
-  await updateFile(
-    site.github_repo,
-    site.github_token,
-    uploadPath,
-    fileContent,
-    `Upload: ${file.originalname}`,
-    'staging'
+  const ghResponse = await fetch(
+    `https://api.github.com/repos/${owner}/${repoName}/contents/${uploadPath}`,
+    {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${site.github_token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: `Upload: ${file.originalname}`,
+        content: fileBase64,
+        branch: 'staging'
+      })
+    }
   );
+  
+  if (!ghResponse.ok) {
+    const ghError = await ghResponse.json();
+    throw new Error(`GitHub upload failed: ${ghError.message}`);
+  }
   
   // Return the public URL path
   const publicUrl = `/uploads/${siteId}/${year}/${month}/${file.originalname}`;
@@ -493,115 +506,7 @@ app.post('/sites/:siteId/approve', async (req, res) => {
 // Storage Abstraction Layer (Swappable for Google Drive)
 // ============================================================
 
-/**
- * Upload a file to storage. Currently uses GitHub, swappable for Google Drive.
- * @param {Object} site - Site object with github_repo and github_token
- * @param {string} siteId - Site identifier for folder organization
- * @param {Object} file - Multer file object
- * @returns {Promise<Object>} - { url, path, name, size }
- */
-async function uploadFileToStorage(site, siteId, file) {
-  const now = new Date();
-  const year = String(now.getFullYear());
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const uploadPath = `dist/uploads/${siteId}/${year}/${month}/${file.originalname}`;
-  
-  // Convert file buffer to base64
-  const fileContent = file.buffer.toString('base64');
-  
-  // Commit file to GitHub staging branch
-  const [owner, repoName] = site.github_repo.split('/');
-  
-  const ghResponse = await fetch(
-    `https://api.github.com/repos/${owner}/${repoName}/contents/${uploadPath}`,
-    {
-      method: 'PUT',
-      headers: {
-        'Authorization': `Bearer ${site.github_token}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        message: `Upload: ${file.originalname}`,
-        content: fileContent,
-        branch: 'staging'
-      })
-    }
-  );
-  
-  if (!ghResponse.ok) {
-    const ghError = await ghResponse.json();
-    throw new Error(`GitHub upload failed: ${ghError.message}`);
-  }
-  
-  // Return the public URL path
-  const publicUrl = `/uploads/${siteId}/${year}/${month}/${file.originalname}`;
-  
-  return {
-    url: publicUrl,
-    path: uploadPath,
-    name: file.originalname,
-    size: file.size,
-    type: file.mimetype
-  };
-}
-
-/**
- * List files for a site from storage.
- * @param {Object} site - Site object with github_repo and github_token
- * @param {string} siteId - Site identifier for folder filtering
- * @returns {Promise<Array>} - Array of { name, path, url, size, sha }
- */
-async function listSiteFiles(site, siteId) {
-  const [owner, repoName] = site.github_repo.split('/');
-  const files = [];
-  
-  try {
-    const treeResponse = await fetch(
-      `https://api.github.com/repos/${owner}/${repoName}/git/trees/staging:dist/uploads?recursive=1`,
-      {
-        headers: {
-          'Authorization': `Bearer ${site.github_token}`,
-          'Accept': 'application/vnd.github.v3+json'
-        }
-      }
-    );
-    
-    if (treeResponse.ok) {
-      const treeData = await treeResponse.json();
-      const prefix = `dist/uploads/${siteId}/`;
-      
-      for (const item of treeData.tree || []) {
-        if (item.type === 'blob' && item.path.startsWith(prefix)) {
-          const relativePath = item.path.slice(prefix.length);
-          const pathParts = relativePath.split('/');
-          if (pathParts.length < 2) continue; // Need YYYY/MM/filename
-          const year = pathParts[0];
-          const month = pathParts[1];
-          const filename = pathParts.slice(2).join('/');
-          
-          files.push({
-            name: filename,
-            path: item.path,
-            url: `/uploads/${siteId}/${year}/${month}/${filename}`,
-            size: item.size,
-            sha: item.sha
-          });
-        }
-      }
-      
-      files.sort((a, b) => b.path.localeCompare(a.path));
-    }
-  } catch (treeError) {
-    console.warn('Could not fetch uploads tree:', treeError.message);
-  }
-  
-  return files;
-}
-
-// ============================================================
-// End Storage Abstraction Layer
-// ============================================================
+// (Storage functions defined at top of file)
 
 // Multer configuration for file uploads (memory storage)
 const upload = multer({
