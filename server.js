@@ -130,13 +130,17 @@ const __dirname = dirname(__filename);
 
 const app = express();
 
-// Serve Themis admin dashboard
-// /themis/ path always works; app.buildwiththemis.com serves at root
+// Serve Themis admin dashboard and marketing site
 app.use('/themis', express.static(join(__dirname, 'themis')));
 app.use((req, res, next) => {
   const host = req.hostname;
+  // app.buildwiththemis.com → Themis dashboard
   if (host === 'app.buildwiththemis.com' && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
     return express.static(join(__dirname, 'themis'))(req, res, next);
+  }
+  // buildwiththemis.com (root) → marketing site
+  if ((host === 'buildwiththemis.com' || host === 'www.buildwiththemis.com') && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
+    return express.static(join(__dirname, 'marketing'))(req, res, next);
   }
   next();
 });
