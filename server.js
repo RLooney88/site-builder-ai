@@ -379,9 +379,17 @@ Authorization: Bearer ${jwtToken}
 
 **For static content edits, use the provided tools:**
 1. Use \`list_files\` to see what files exist in a directory
-2. Use \`read_file\` to get the current content of a file
-3. Use \`write_file\` to update the file on the staging branch
-4. The user will preview via their staging URL and publish when ready
+2. Use \`read_file\` to get the current content of a file (auto-truncates large files)
+3. Use \`read_file_section\` to search for and read a specific part of a large file (more efficient)
+4. Use \`write_file\` to update the file on the staging branch
+5. Use \`revert_file\` if you need to undo changes
+6. The user will preview via their staging URL and publish when ready
+
+**TOKEN EFFICIENCY RULES:**
+- For large HTML files (>15KB), use \`read_file_section\` with a search term instead of \`read_file\`
+- When rewriting a page, you MUST include the COMPLETE file content in write_file — not just the changed section
+- Don't read files you don't need to edit
+- One list_files call is usually enough — don't browse multiple directories unless necessary
 
 **ALWAYS use the tools to make actual edits. NEVER just describe what you would do — actually do it using the tools.**
 
@@ -483,6 +491,20 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         }
       },
       {
+        name: 'read_file_section',
+        description: 'Read a specific section of a file by searching for a text pattern. Returns 50 lines around the match. More token-efficient than read_file for large files.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path in the repo' },
+            search: { type: 'string', description: 'Text to search for in the file' },
+            context_lines: { type: 'number', description: 'Number of lines before and after match to include (default 25)' },
+            branch: { type: 'string', description: 'Branch to read from', default: 'staging' }
+          },
+          required: ['path', 'search']
+        }
+      },
+      {
         name: 'revert_file',
         description: 'Revert a file to its version on the main (production) branch, undoing any staging changes.',
         input_schema: {
@@ -524,14 +546,47 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         }
         const data = await resp.json();
         if (!data.content) {
-          return `Error: File content not available (file may be too large). Size: ${data.size || 'unknown'} bytes.`;
+          return `Error: File content not available (file may be too large). Size: ${data.size || 'unknown'} bytes. Use read_file_section to read specific parts.`;
         }
         const content = Buffer.from(data.content, 'base64').toString('utf-8');
-        // Truncate very large files
-        if (content.length > 50000) {
-          return content.slice(0, 50000) + '\n\n[... truncated, file is ' + content.length + ' chars]';
+        // For large files, return structure overview + truncated content
+        if (content.length > 15000) {
+          const lines = content.split('\n');
+          const summary = `[File is ${content.length} chars, ${lines.length} lines — showing first 300 lines. Use read_file_section with a search term to find specific content.]\n\n`;
+          return summary + lines.slice(0, 300).join('\n');
         }
         return content;
+      }
+
+      if (toolName === 'read_file_section') {
+        const branch = toolInput.branch || 'staging';
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=${branch}`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        if (!data.content) return 'File content not available.';
+        const content = Buffer.from(data.content, 'base64').toString('utf-8');
+        const lines = content.split('\n');
+        const contextLines = toolInput.context_lines || 25;
+        
+        // Find the search term
+        const searchLower = toolInput.search.toLowerCase();
+        const matchIndex = lines.findIndex(l => l.toLowerCase().includes(searchLower));
+        
+        if (matchIndex === -1) {
+          return `Search term "${toolInput.search}" not found in ${toolInput.path}. File has ${lines.length} lines.`;
+        }
+        
+        const start = Math.max(0, matchIndex - contextLines);
+        const end = Math.min(lines.length, matchIndex + contextLines + 1);
+        const section = lines.slice(start, end);
+        
+        return `[Lines ${start + 1}-${end} of ${lines.length} in ${toolInput.path}]\n\n${section.join('\n')}`;
       }
 
       if (toolName === 'write_file') {
@@ -651,6 +706,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     const toolStatusMap = {
       list_files: (input) => `Browsing ${input.path || 'files'}...`,
       read_file: (input) => `Reading ${input.path?.split('/').pop() || 'file'}...`,
+      read_file_section: (input) => `Searching for "${input.search?.slice(0, 30)}" in ${input.path?.split('/').pop() || 'file'}...`,
       write_file: (input) => `Saving changes to ${input.path?.split('/').pop() || 'file'}...`,
       revert_file: (input) => `Reverting ${input.path?.split('/').pop() || 'file'}...`,
     };
@@ -669,7 +725,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-5',
         max_tokens: 4096,
-        system: buildSystemPrompt(site, cmsApiUrl, jwtToken),
+        system: [{ type: 'text', text: buildSystemPrompt(site, cmsApiUrl, jwtToken), cache_control: { type: 'ephemeral' } }],
         tools,
         messages: currentMessages
       });
