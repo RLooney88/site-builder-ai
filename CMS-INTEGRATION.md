@@ -88,6 +88,31 @@ Each site in the database has a `config` JSONB field:
 
 ## Example Workflows
 
+### Petition Creation - Deferred to CMS
+
+```
+User: "Create a petition to support election security legislation"
+
+AI responds:
+"Creating petitions is best done through the Petition Manager in the admin dashboard - it has a full form builder with:
+
+- Multiple field types (name, email, address, etc.)
+- Email notification configuration
+- Goal tracking and progress bars
+- Custom confirmation messages
+- Preview and testing tools
+
+Here's how to create it:
+1. Go to https://secure-the-vote.vercel.app/admin/
+2. Click 'Petition Manager' in the sidebar
+3. Click 'Create New Petition'
+4. Fill in the petition details and configure the form fields
+5. Set up email notifications and confirmation messages
+6. Preview and publish
+
+Would you like help with something else, like updating the homepage or creating a blog post about the petition?"
+```
+
 ### Blog Post Creation via AI
 
 ```
@@ -173,12 +198,27 @@ AI responds:
 
 ## Limitations
 
-### Current Scope
-- AI can READ all CMS data (posts, banners, petitions)
-- AI can CREATE/UPDATE blog posts and publish them
-- AI can UPDATE banner settings
-- AI CANNOT delete admins or modify admin permissions
-- AI CANNOT export signatures or modify petition submissions
+### What AI Can Do
+
+**Direct Actions (via API or GitHub):**
+- ✅ Create/edit blog posts
+- ✅ Update banner text and link
+- ✅ Edit static pages (.njk templates)
+- ✅ Modify CSS and JavaScript
+- ✅ Update navigation/footer
+- ✅ Basic SEO optimization
+
+**What AI Defers to CMS Dashboard:**
+- ❌ Creating petitions → "Use Petition Manager in dashboard"
+- ❌ Exporting signatures → "Use admin dashboard export feature"
+- ❌ Managing admins → "Use Admin Settings in dashboard"
+- ❌ Complex petition configuration → CMS UI is better
+
+**Why the boundary?**
+- Petitions have complex form builders with many fields
+- Admin management is security-sensitive
+- Data exports have better filtering UI in dashboard
+- Some tasks are just faster/easier with dedicated UI tools
 
 ### Future Enhancements
 - [ ] AI-powered SEO optimization (auto-generate titles/descriptions)
