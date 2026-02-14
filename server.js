@@ -131,7 +131,15 @@ const __dirname = dirname(__filename);
 const app = express();
 
 // Serve Themis admin dashboard
+// /themis/ path always works; app.buildwiththemis.com serves at root
 app.use('/themis', express.static(join(__dirname, 'themis')));
+app.use((req, res, next) => {
+  const host = req.hostname;
+  if (host === 'app.buildwiththemis.com' && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
+    return express.static(join(__dirname, 'themis'))(req, res, next);
+  }
+  next();
+});
 const PORT = process.env.PORT || 3000;
 
 // Database setup
