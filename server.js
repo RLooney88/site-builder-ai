@@ -228,12 +228,22 @@ app.post('/sites/:siteId/chat', async (req, res) => {
 app.get('/sites/:siteId/history', async (req, res) => {
   try {
     const { siteId } = req.params;
+    
+    // Check if site exists
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Get or create session
     const session = await getSession(siteId);
+    
+    // Get chat history (may be empty for new sessions)
     const history = await getChatHistory(session.id, 50);
     
     res.json({
       sessionId: session.id,
-      messages: history
+      messages: history || []
     });
   } catch (error) {
     console.error('History error:', error);
