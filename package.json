@@ -15,7 +15,8 @@
     "dotenv": "^16.3.1",
     "@anthropic-ai/sdk": "^0.20.0",
     "simple-git": "^3.22.0",
-    "body-parser": "^1.20.2"
+    "body-parser": "^1.20.2",
+    "jsonwebtoken": "^9.0.2"
   },
   "engines": {
     "node": ">=18.0.0"

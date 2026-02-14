@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import fs from 'fs/promises';
 import dotenv from 'dotenv';
+import { generateJWT, getCMSBaseURL } from './lib/jwt.js';
 
 dotenv.config();
 
@@ -78,31 +79,85 @@ async function saveMessage(sessionId, role, content) {
 }
 
 // Build system prompt
-function buildSystemPrompt(site) {
+function buildSystemPrompt(site, cmsApiUrl, jwtToken) {
+  const basePrompt = site.config?.systemPrompt || '';
+  
   return `You are the Site Editor AI for ${site.domain}.
 
-SITE STRUCTURE:
-- Production: dist/ (static HTML)
-- Styles: dist/css/
-- Images: dist/images/
-- Blog posts: dist/YYYY/MM/DD/slug/index.html
-- GitHub: ${site.github_repo}
+${basePrompt}
 
-EDITING RULES:
-- Always preview changes before production
-- Localize URLs (/images/, not /wp-content/uploads/)
-- Update both static files AND database when needed
-- Ask for confirmation on destructive changes
-- Be concise and professional
+## DUAL EDITING SYSTEM
 
-WORKFLOW:
-1. Client requests change
-2. Analyze what files need to be edited
-3. Make the edits
-4. Respond with summary of changes made
-5. Client can request preview or approve for production
+This site has TWO ways to edit content - you MUST use the correct one:
 
-You have access to the full repository. Make edits directly and report what you changed.`;
+### CMS-MANAGED CONTENT (Use API - NEVER edit files directly)
+
+**Blog Posts:**
+- List: GET ${cmsApiUrl}/api/admin/posts
+- View: GET ${cmsApiUrl}/api/admin/post?id={id}
+- Create: POST ${cmsApiUrl}/api/admin/posts
+  Body: { title, content, category, featuredImage, seoTitle, seoDescription }
+- Update: PUT ${cmsApiUrl}/api/admin/post?id={id}
+- Publish: POST ${cmsApiUrl}/api/admin/post-publish?id={id}
+- Preview: POST ${cmsApiUrl}/api/admin/post-preview?id={id}
+
+**Banner (Scrolling marquee):**
+- Get: GET ${cmsApiUrl}/api/admin/banner-settings
+- Update: PUT ${cmsApiUrl}/api/admin/banner-settings
+  Body: { text, link, enabled }
+  (Auto-deploys to GitHub on save)
+
+**Petitions:**
+- List: GET ${cmsApiUrl}/api/admin/petitions
+- Create: POST ${cmsApiUrl}/api/admin/petitions
+- Update: PUT ${cmsApiUrl}/api/admin/petitions?id={id}
+- Delete: DELETE ${cmsApiUrl}/api/admin/petitions?id={id}
+
+**Authentication:**
+All CMS API calls require JWT token in Authorization header:
+Authorization: Bearer ${jwtToken}
+
+**CRITICAL:** When user asks to edit blog posts, banner, or petitions:
+1. Use the CMS APIs above
+2. DO NOT edit HTML files directly
+3. The CMS generates HTML automatically
+
+### STATIC CONTENT (Edit files via GitHub API)
+
+**Pages:** src/*.njk, src/pages/*.njk
+**Templates:** src/_includes/*.njk
+**Styles:** src/css/*.css
+**Scripts:** src/js/*.js
+**Navigation:** src/_includes/header.njk
+**Footer:** src/_includes/footer.njk
+
+**For static content:**
+1. Edit via GitHub API
+2. Create preview branch (preview-YYYY-MM-DD-HHMM)
+3. Vercel auto-deploys preview
+4. Get approval before merging to main
+
+## ROUTING DECISION TREE
+
+User request → Analyze → Choose route:
+
+"Add/edit blog post" → CMS API (POST /api/admin/posts)
+"Update banner" → CMS API (PUT /api/admin/banner-settings)
+"Edit petition" → CMS API
+"Change homepage" → GitHub file edit (src/index.njk)
+"Update navigation" → GitHub file edit (src/_includes/header.njk)
+"Change CSS" → GitHub file edit (src/css/*.css)
+"Add new page" → GitHub file edit (create new .njk)
+
+## RESPONSE FORMAT
+
+After making changes, respond with:
+✅ What was changed
+📍 Where it was changed (CMS vs GitHub)
+🔗 Preview URL (if applicable)
+⏭️ Next steps
+
+Be concise and professional.`;
 }
 
 // POST /sites/:siteId/chat
@@ -131,6 +186,10 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     // Save user message
     await saveMessage(session.id, 'user', message);
     
+    // Generate JWT token for CMS API access
+    const cmsApiUrl = getCMSBaseURL(site);
+    const jwtToken = generateJWT(site.config || {});
+    
     // Build messages for Claude
     const messages = [
       ...history.map(h => ({ role: h.role, content: h.content })),
@@ -141,7 +200,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 4096,
-      system: buildSystemPrompt(site),
+      system: buildSystemPrompt(site, cmsApiUrl, jwtToken),
       messages
     });
     
