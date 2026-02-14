@@ -21,9 +21,17 @@ const PORT = process.env.PORT || 3000;
 
 // Database setup
 const { Pool } = pg;
+// Railway DATABASE_URL from environment, with fallback for Railway deployments
+const DATABASE_URL = process.env.DATABASE_URL?.trim() 
+  || process.env.DATABASE_PRIVATE_URL?.trim()
+  || process.env.RAILWAY_DATABASE_URL?.trim();
+
+if (!DATABASE_URL) {
+  console.error('FATAL: No DATABASE_URL configured. Set DATABASE_URL environment variable.');
+}
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL?.trim(),
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 // Claude API
