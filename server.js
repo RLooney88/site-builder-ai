@@ -715,7 +715,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     let currentMessages = messages;
     let assistantMessage = '';
     let loopCount = 0;
-    const MAX_LOOPS = 10;
+    const MAX_LOOPS = 25;
 
     sendStatus('Thinking...');
 
