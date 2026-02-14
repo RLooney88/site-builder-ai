@@ -802,10 +802,10 @@ Be friendly, concise, and non-technical.`;
 app.post('/sites/:siteId/chat', async (req, res) => {
   try {
     const { siteId } = req.params;
-    const { message } = req.body;
-    
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
+    const { message, images } = req.body;
+
+    if (!message && (!images || images.length === 0)) {
+      return res.status(400).json({ error: 'Message or images are required' });
     }
     
     // Get site
@@ -829,9 +829,26 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     const jwtToken = generateJWT(site.config || {});
     
     // Build messages for Claude
+    // Include images as vision content blocks if provided
+    const userContent = [];
+    if (message) {
+      userContent.push({ type: 'text', text: message });
+    }
+    if (images && images.length > 0) {
+      for (const imageUrl of images) {
+        userContent.push({
+          type: 'image',
+          source: {
+            type: 'url',
+            url: imageUrl
+          }
+        });
+      }
+    }
+
     const messages = [
       ...history.map(h => ({ role: h.role, content: h.content })),
-      { role: 'user', content: message }
+      { role: 'user', content: userContent }
     ];
     
     // Define tools for Claude to use
@@ -924,6 +941,103 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           properties: {
             path: { type: 'string', description: 'Directory path (e.g., dist/ or dist/css/)' },
             branch: { type: 'string', description: 'Branch to list from', default: 'staging' }
+          },
+          required: ['path']
+        }
+      },
+      {
+        name: 'capture_screenshot',
+        description: 'Take a screenshot of a page on the staging site to see what it looks like. Use this to verify your changes or compare against a reference image.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'The page path to screenshot, e.g. "/" or "/about/"' }
+          },
+          required: ['path']
+        }
+      },
+      {
+        name: 'search_and_replace',
+        description: 'Find and replace text in a file. Much more efficient than rewriting the entire file for small changes like updating text, changing colors, or swapping URLs.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path in the repo (e.g., dist/index.html)' },
+            search: { type: 'string', description: 'Exact text to find in the file' },
+            replace: { type: 'string', description: 'Replacement text' },
+            message: { type: 'string', description: 'Commit message describing the change' },
+            all: { type: 'boolean', description: 'Replace all occurrences (default: true)' }
+          },
+          required: ['path', 'search', 'replace', 'message']
+        }
+      },
+      {
+        name: 'get_page_styles',
+        description: 'Extract CSS styles relevant to a page. Returns all CSS rules that could affect the page, helping you understand the current styling before making changes.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Path to the HTML file (e.g., dist/index.html)' }
+          },
+          required: ['path']
+        }
+      },
+      {
+        name: 'create_page',
+        description: 'Create a new page using an existing page as a template. Copies the head, navigation, and footer from the template page and inserts your new content in the main area.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            template_path: { type: 'string', description: 'Existing page to use as template (e.g., dist/index.html)' },
+            new_path: { type: 'string', description: 'Path for the new page (e.g., dist/about/index.html)' },
+            title: { type: 'string', description: 'Page title' },
+            content: { type: 'string', description: 'HTML for the main content area' },
+            message: { type: 'string', description: 'Commit message' }
+          },
+          required: ['template_path', 'new_path', 'title', 'content', 'message']
+        }
+      },
+      {
+        name: 'validate_html',
+        description: 'Check an HTML file for common issues like unclosed tags, missing quotes, or broken structure. Use this after making changes to catch problems before the user previews.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path in the repo (e.g., dist/index.html)' }
+          },
+          required: ['path']
+        }
+      },
+      {
+        name: 'diff_preview',
+        description: 'Show what changed in a file compared to the production version. Helps users understand exactly what edits were made.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path in the repo (e.g., dist/index.html)' }
+          },
+          required: ['path']
+        }
+      },
+      {
+        name: 'get_site_colors',
+        description: 'Extract the color palette used across the site\'s CSS files. Returns all colors (hex, rgb, hsl) found in stylesheets so you can match the site\'s branding.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Specific CSS file path (optional, defaults to all CSS in dist/css/)' }
+          }
+        }
+      },
+      {
+        name: 'resize_image',
+        description: 'Check an image and provide recommendations for web optimization. Reports file size and dimensions with advice on reducing load times.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Path to image in the repo (e.g., dist/images/photo.jpg)' },
+            max_width: { type: 'number', description: 'Target maximum width (default: 1200)' },
+            quality: { type: 'number', description: 'Quality setting for JPEG (default: 85)' }
           },
           required: ['path']
         }
@@ -1186,6 +1300,440 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         return items.map(i => `${i.type === 'dir' ? '📁' : '📄'} ${i.name} (${i.size || 'dir'})`).join('\n');
       }
 
+      if (toolName === 'capture_screenshot') {
+        // Get staging preview URL from site config or construct it
+        const stagingSlug = site.config?.vercelSlug || 'rcl-integrated';
+        const stagingDomain = site.vercel_project
+          ? `${site.vercel_project}-git-staging-${stagingSlug}.vercel.app`
+          : 'secure-the-vote-git-staging-rcl-integrated.vercel.app';
+        const previewUrl = `https://${stagingDomain}${toolInput.path}`;
+
+        console.log(`[Screenshot] Capturing: ${previewUrl}`);
+
+        try {
+          // Dynamic import for puppeteer (serverless-compatible)
+          const puppeteer = await import('puppeteer-core');
+          const chromium = await import('@sparticuz/chromium');
+
+          const browser = await puppeteer.default.launch({
+            args: await chromium.default.args,
+            defaultViewport: chromium.default.defaultViewport,
+            executablePath: await chromium.default.executablePath,
+            headless: chromium.default.headless,
+          });
+
+          const page = await browser.newPage();
+          await page.goto(previewUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+          const screenshotBuffer = await page.screenshot({ type: 'png' });
+          await browser.close();
+
+          // Return as structured content for Claude vision
+          const base64 = screenshotBuffer.toString('base64');
+          return { __image: true, base64, media_type: 'image/png' };
+        } catch (screenshotError) {
+          console.error('Screenshot error:', screenshotError.message);
+          return `Error capturing screenshot: ${screenshotError.message}. Make sure the staging site is deployed and accessible.`;
+        }
+      }
+
+      if (toolName === 'search_and_replace') {
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        if (!data.content) return 'File content not available.';
+        
+        let content = Buffer.from(data.content, 'base64').toString('utf-8');
+        const replaceAll = toolInput.all !== false;
+        
+        // Find count of matches
+        const occurrences = content.split(toolInput.search).length - 1;
+        if (occurrences === 0) {
+          return `Search text "${toolInput.search}" not found in ${toolInput.path}. Use read_file_section to find the exact text first.`;
+        }
+        
+        // Replace occurrences
+        if (replaceAll) {
+          content = content.split(toolInput.search).join(toolInput.replace);
+        } else {
+          content = content.replace(toolInput.search, toolInput.replace);
+        }
+        
+        // Write back
+        const body = {
+          message: toolInput.message || `Replace text in ${toolInput.path}`,
+          content: Buffer.from(content, 'utf-8').toString('base64'),
+          branch: 'staging',
+          sha: data.sha
+        };
+        
+        const writeResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+          {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          }
+        );
+        if (!writeResp.ok) {
+          const err = await writeResp.json();
+          return `Error writing file: ${err.message}`;
+        }
+        
+        const replacedCount = replaceAll ? occurrences : 1;
+        return `Successfully replaced ${replacedCount} occurrence${replacedCount !== 1 ? 's' : ''} of "${toolInput.search}" in ${toolInput.path}`;
+      }
+
+      if (toolName === 'get_page_styles') {
+        // Read the HTML file
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        if (!data.content) return 'File content not available.';
+        const htmlContent = Buffer.from(data.content, 'base64').toString('utf-8');
+        
+        // Extract linked stylesheets
+        const styleSheetPattern = /<link[^>]*rel="stylesheet"[^>]*href="([^"]+)"/gi;
+        const styleMatches = [...htmlContent.matchAll(styleSheetPattern)];
+        const stylesheets = styleMatches.map(m => m[1]);
+        
+        // Extract inline styles
+        const styleTagPattern = /<style[^>]*>([\s\S]*?)<\/style>/gi;
+        const styleTagMatches = [...htmlContent.matchAll(styleTagPattern)];
+        const inlineStyles = styleTagMatches.map(m => m[1]);
+        
+        let allCss = '';
+        
+        // Fetch each linked stylesheet
+        for (const href of stylesheets) {
+          if (href.startsWith('http')) continue; // Skip external URLs
+          const cleanPath = href.startsWith('/') ? href.slice(1) : href;
+          try {
+            const cssResp = await fetch(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${cleanPath}?ref=staging`,
+              { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+            );
+            if (cssResp.ok) {
+              const cssData = await cssResp.json();
+              if (cssData.content) {
+                allCss += `/* === ${cleanPath} ===\n */\n`;
+                allCss += Buffer.from(cssData.content, 'base64').toString('utf-8');
+                allCss += '\n\n';
+              }
+            }
+          } catch (e) {
+            console.warn(`Could not fetch stylesheet ${href}:`, e.message);
+          }
+        }
+        
+        // Add inline styles
+        for (const inlineStyle of inlineStyles) {
+          allCss += `/* === Inline <style> ===\n */\n`;
+          allCss += inlineStyle + '\n\n';
+        }
+        
+        // Truncate if too large
+        if (allCss.length > 10000) {
+          return allCss.slice(0, 10000) + `\n\n[CSS truncated — total size is ${allCss.length} characters. Showing first 10000 chars. Use get_site_colors to extract color palette or read specific CSS files directly.]`;
+        }
+        
+        return allCss || 'No stylesheets or inline styles found on this page.';
+      }
+
+      if (toolName === 'create_page') {
+        // Read template page
+        const templateResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.template_path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!templateResp.ok) {
+          const err = await templateResp.json();
+          return `Error reading template: ${err.message}`;
+        }
+        const templateData = await templateResp.json();
+        if (!templateData.content) return 'Template content not available.';
+        const templateContent = Buffer.from(templateData.content, 'base64').toString('utf-8');
+        
+        // Extract header/footer from template
+        const extracted = extractHeaderFooter(templateContent);
+        let header = extracted.header;
+        const footer = extracted.footer;
+        
+        // Update title in header
+        header = header.replace(/<title>[^<]*<\/title>/i, `<title>${toolInput.title}</title>`);
+        
+        // Construct new page
+        const newPage = header + '\n' + toolInput.content + '\n' + footer;
+        
+        // Write new page
+        const body = {
+          message: toolInput.message || `Create new page: ${toolInput.new_path}`,
+          content: Buffer.from(newPage, 'utf-8').toString('base64'),
+          branch: 'staging'
+        };
+        
+        const writeResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.new_path}`,
+          {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          }
+        );
+        if (!writeResp.ok) {
+          const err = await writeResp.json();
+          return `Error creating page: ${err.message}`;
+        }
+        
+        return `New page created at ${toolInput.new_path} with title "${toolInput.title}". Header, nav, and footer from template preserved.`;
+      }
+
+      if (toolName === 'validate_html') {
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        if (!data.content) return 'File content not available.';
+        const content = Buffer.from(data.content, 'base64').toString('utf-8');
+        
+        const issues = [];
+        
+        // Check for DOCTYPE
+        if (!/<\s*!DOCTYPE/i.test(content) && !/<html/i.test(content)) {
+          issues.push('Missing DOCTYPE or <html> tag');
+        }
+        
+        // Check for basic structure
+        const hasHead = /<head/i.test(content);
+        const hasBody = /<body/i.test(content);
+        if (!hasHead && !hasBody) {
+          issues.push('Missing <head> and <body> tags');
+        }
+        
+        // Count opening vs closing tags for common elements
+        const tags = ['div', 'section', 'main', 'header', 'footer', 'p', 'a', 'span', 'ul', 'li'];
+        for (const tag of tags) {
+          const openCount = (content.match(new RegExp(`<${tag}[\\s>]`, 'gi')) || []).length;
+          const closeCount = (content.match(new RegExp(`</${tag}>`, 'gi')) || []).length;
+          if (openCount !== closeCount) {
+            issues.push(`Tag mismatch: <${tag}> has ${openCount} opening tags but ${closeCount} closing tags`);
+          }
+        }
+        
+        // Check for unclosed quotes in attributes
+        const attrPattern = /\s\w+="[^"]*$/gm;
+        if (attrPattern.test(content)) {
+          issues.push('Found potential unclosed quotes in attributes');
+        }
+        
+        if (issues.length === 0) {
+          return 'No issues found. HTML structure looks good!';
+        }
+        
+        return 'Potential issues found:\n' + issues.map((i, idx) => `${idx + 1}. ${i}`).join('\n');
+      }
+
+      if (toolName === 'diff_preview') {
+        // Read from staging
+        const stagingResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!stagingResp.ok) {
+          const err = await stagingResp.json();
+          return `Error reading staging version: ${err.message}`;
+        }
+        const stagingData = await stagingResp.json();
+        if (!stagingData.content) return 'Staging content not available.';
+        const stagingContent = Buffer.from(stagingData.content, 'base64').toString('utf-8');
+        
+        // Read from main
+        const mainResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=main`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!mainResp.ok) {
+          return `File does not exist in production (main branch). This is a new file.`;
+        }
+        const mainData = await mainResp.json();
+        if (!mainData.content) return 'Main content not available.';
+        const mainContent = Buffer.from(mainData.content, 'base64').toString('utf-8');
+        
+        // Simple line-by-line diff
+        const stagingLines = stagingContent.split('\n');
+        const mainLines = mainContent.split('\n');
+        
+        const diff = [];
+        const maxLen = Math.max(stagingLines.length, mainLines.length);
+        let changeCount = 0;
+        const maxChanges = 50;
+        
+        for (let i = 0; i < maxLen && changeCount < maxChanges; i++) {
+          const stagingLine = stagingLines[i] || '';
+          const mainLine = mainLines[i] || '';
+          
+          if (stagingLine !== mainLine) {
+            changeCount++;
+            if (mainLine) diff.push(`- ${mainLine}`);
+            if (stagingLine) diff.push(`+ ${stagingLine}`);
+            diff.push('');
+          }
+        }
+        
+        if (changeCount === 0) {
+          return 'No differences found between staging and production.';
+        }
+        
+        const summary = `${changeCount} changes${changeCount >= maxChanges ? ' (showing first 50)' : ''}:\n\n`;
+        return summary + diff.slice(0, 150).join('\n');
+      }
+
+      if (toolName === 'get_site_colors') {
+        let cssFiles = [];
+        let allCss = '';
+        
+        if (toolInput.path) {
+          // Read specific CSS file
+          const resp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          if (!resp.ok) {
+            const err = await resp.json();
+            return `Error reading file: ${err.message}`;
+          }
+          const data = await resp.json();
+          if (!data.content) return 'File content not available.';
+          allCss = Buffer.from(data.content, 'base64').toString('utf-8');
+        } else {
+          // List all CSS files in dist/css/
+          try {
+            const listResp = await fetch(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/dist/css?ref=staging`,
+              { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+            );
+            if (listResp.ok) {
+              const items = await listResp.json();
+              for (const item of items) {
+                if (item.name.endsWith('.css')) {
+                  try {
+                    const cssResp = await fetch(
+                      `https://api.github.com/repos/${owner}/${repoName}/contents/dist/css/${item.name}?ref=staging`,
+                      { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+                    );
+                    if (cssResp.ok) {
+                      const cssData = await cssResp.json();
+                      if (cssData.content) {
+                        allCss += Buffer.from(cssData.content, 'base64').toString('utf-8') + '\n';
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`Error reading CSS file ${item.name}:`, e.message);
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('Error listing CSS files:', e.message);
+            return 'Could not list CSS files. Try specifying a path parameter.';
+          }
+        }
+        
+        // Extract colors using regex
+        const hexPattern = /#[0-9A-Fa-f]{3,8}/g;
+        const rgbPattern = /rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/g;
+        const hslPattern = /hsla?\s*\(\s*(\d+)\s*,\s*(\d+)%\s*,\s*(\d+)%/g;
+        const cssVarPattern = /--([\w-]+)\s*:\s*([^;]+);/g;
+        
+        const colors = {
+          hex: new Set(),
+          rgb: new Set(),
+          hsl: new Set(),
+          cssVars: new Set()
+        };
+        
+        // Extract hex colors
+        let match;
+        while ((match = hexPattern.exec(allCss))) {
+          colors.hex.add(match[0]);
+        }
+        
+        // Extract rgb colors
+        while ((match = rgbPattern.exec(allCss))) {
+          colors.rgb.add(`rgb(${match[1]}, ${match[2]}, ${match[3]})`);
+        }
+        
+        // Extract hsl colors
+        while ((match = hslPattern.exec(allCss))) {
+          colors.hsl.add(`hsl(${match[1]}, ${match[2]}%, ${match[3]}%)`);
+        }
+        
+        // Extract CSS custom properties that contain colors
+        while ((match = cssVarPattern.exec(allCss))) {
+          const varName = match[1];
+          const varValue = match[2].trim();
+          if (/#[0-9A-Fa-f]{3,8}/.test(varValue) || /rgb/.test(varValue) || /hsl/.test(varValue)) {
+            colors.cssVars.add(`--${varName}: ${varValue}`);
+          }
+        }
+        
+        let result = '**Color Palette Extracted:**\n\n';
+        if (colors.hex.size > 0) result += `**Hex Colors (${colors.hex.size}):**\n${Array.from(colors.hex).join(', ')}\n\n`;
+        if (colors.rgb.size > 0) result += `**RGB Colors (${colors.rgb.size}):**\n${Array.from(colors.rgb).join(', ')}\n\n`;
+        if (colors.hsl.size > 0) result += `**HSL Colors (${colors.hsl.size}):**\n${Array.from(colors.hsl).join(', ')}\n\n`;
+        if (colors.cssVars.size > 0) result += `**CSS Variables (${colors.cssVars.size}):**\n${Array.from(colors.cssVars).join('\n')}\n`;
+        
+        if (colors.hex.size === 0 && colors.rgb.size === 0 && colors.hsl.size === 0 && colors.cssVars.size === 0) {
+          return 'No colors found in CSS files.';
+        }
+        
+        return result;
+      }
+
+      if (toolName === 'resize_image') {
+        // Read image metadata from GitHub
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        const fileSizeKB = (data.size / 1024).toFixed(1);
+        
+        // Provide feedback
+        let result = `**Image Info:** ${toolInput.path}\n`;
+        result += `**File Size:** ${fileSizeKB} KB\n\n`;
+        
+        if (data.size < 500 * 1024) {
+          result += 'This image is already web-optimized (under 500 KB). No resizing needed.';
+        } else {
+          result += `This image is ${fileSizeKB} KB and could be optimized for web.\n`;
+          result += `**Recommendation:** Upload a pre-sized version at max-width: ${toolInput.max_width || 1200}px with quality ${toolInput.quality || 85} for JPEG.\n`;
+          result += 'For best results, use an online image optimizer like TinyPNG or ImageOptim before uploading.';
+        }
+        
+        return result;
+      }
+
       return `Unknown tool: ${toolName}`;
     }
 
@@ -1214,6 +1762,14 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       replace_page_content: (input) => `Updating page content in ${input.path?.split('/').pop() || 'page'}...`,
       verify_links: () => `Checking links...`,
       revert_file: (input) => `Reverting ${input.path?.split('/').pop() || 'file'}...`,
+      capture_screenshot: (input) => `Taking a screenshot of ${input.path || '/'}...`,
+      search_and_replace: (input) => `Finding and replacing "${input.search?.slice(0, 30)}" in ${input.path?.split('/').pop() || 'file'}...`,
+      get_page_styles: (input) => `Extracting CSS styles from ${input.path?.split('/').pop() || 'page'}...`,
+      create_page: (input) => `Creating new page from template...`,
+      validate_html: (input) => `Validating HTML structure in ${input.path?.split('/').pop() || 'file'}...`,
+      diff_preview: (input) => `Comparing ${input.path?.split('/').pop() || 'file'} against production...`,
+      get_site_colors: (input) => `Extracting color palette${input.path ? ' from ' + input.path.split('/').pop() : ''}...`,
+      resize_image: (input) => `Checking image optimization for ${input.path?.split('/').pop() || 'image'}...`,
     };
 
     // Call Claude with tools — loop until we get a final text response
@@ -1252,7 +1808,19 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           console.log(`[Tool] ${block.name}: ${JSON.stringify(block.input).slice(0, 300)}`);
           try {
             const result = await executeTool(block.name, block.input);
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: String(result || 'Tool completed with no output.') });
+            // Handle image results (screenshots) — return as image content block for Claude vision
+            if (result && result.__image) {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: block.id,
+                content: [
+                  { type: 'text', text: 'Screenshot captured successfully. Here is what the page looks like:' },
+                  { type: 'image', source: { type: 'base64', media_type: result.media_type, data: result.base64 } }
+                ]
+              });
+            } else {
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: String(result || 'Tool completed with no output.') });
+            }
           } catch (toolErr) {
             console.error(`Tool error (${block.name}):`, toolErr.message);
             toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Tool error: ${toolErr.message}`, is_error: true });
