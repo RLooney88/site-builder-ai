@@ -759,6 +759,10 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       for (const block of response.content) {
         if (block.type === 'text') {
           assistantMessage += block.text;
+          // Stream intermediate text as a progress message
+          if (wantsStream && block.text.trim()) {
+            res.write(`data: ${JSON.stringify({ type: 'progress', text: block.text.trim() })}\n\n`);
+          }
         } else if (block.type === 'tool_use') {
           const friendlyStatus = toolStatusMap[block.name]?.(block.input) || `Running ${block.name}...`;
           sendStatus(friendlyStatus);
