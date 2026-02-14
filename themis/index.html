@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Themis — Site Management Dashboard</title>
+  <link rel="stylesheet" href="css/themis.css">
+</head>
+<body>
+  <!-- Login View -->
+  <div id="login-view" class="view active">
+    <div class="login-container">
+      <div class="login-card">
+        <div class="login-header">
+          <h1>Themis</h1>
+          <p>Site Management Dashboard</p>
+        </div>
+        <form id="login-form">
+          <div class="form-group">
+            <label for="email">Email Address</label>
+            <input type="email" id="email" name="email" required autocomplete="email" placeholder="your.email@example.com">
+          </div>
+          <div class="form-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required autocomplete="current-password" placeholder="Enter your password">
+          </div>
+          <div id="login-error" class="error-message" style="display: none;"></div>
+          <button type="submit" class="btn btn-primary">Sign In</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dashboard View -->
+  <div id="dashboard-view" class="view">
+    <!-- Header -->
+    <header class="dashboard-header">
+      <div class="header-left">
+        <div class="logo-area">
+          <h1>Themis</h1>
+        </div>
+        <div class="site-selector">
+          <select id="site-select" class="site-dropdown">
+            <option value="">Select a site...</option>
+          </select>
+        </div>
+      </div>
+      <div class="header-right">
+        <button id="preview-btn" class="btn btn-secondary">Preview Edits</button>
+        <button id="publish-btn" class="btn btn-primary">Publish Edits</button>
+        <button id="logout-btn" class="btn btn-outline">Logout</button>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="dashboard-tabs">
+      <button class="tab-btn active" data-tab="ai-editor">AI Editor</button>
+      <button class="tab-btn" data-tab="posts">Posts</button>
+      <button class="tab-btn" data-tab="petitions">Petitions</button>
+      <button class="tab-btn" data-tab="banner">Banner Settings</button>
+    </nav>
+
+    <!-- Tab Content -->
+    <main class="dashboard-main">
+      <!-- AI Editor Tab -->
+      <div id="tab-ai-editor" class="tab-content active">
+        <div class="chat-container">
+          <div class="messages" id="messages">
+            <div class="empty-state">
+              <h2>Welcome to AI Editor</h2>
+              <p>Ask me to edit your site, add new pages, update content, or make design changes.</p>
+            </div>
+          </div>
+        </div>
+        
+        <div class="input-container">
+          <div class="input-wrapper">
+            <div class="input-area" id="input-area">
+              <textarea
+                id="message-input"
+                placeholder="Ask the AI to edit your site... (e.g., 'Add a new Donate page with a payment form')"
+                rows="1"
+              ></textarea>
+              <div class="drop-overlay" id="drop-overlay">
+                <span>Drop image here</span>
+              </div>
+            </div>
+            <div class="chat-attachments" id="chat-attachments"></div>
+            <div class="input-actions">
+              <button class="attach-btn" id="attach-btn" title="Attach image">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                </svg>
+              </button>
+              <button class="upload-btn" id="upload-btn" title="Upload image">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="17 8 12 3 7 8"></polyline>
+                  <line x1="12" y1="3" x2="12" y2="15"></line>
+                </svg>
+              </button>
+              <button class="send-btn" id="send-btn">Send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Posts Tab -->
+      <div id="tab-posts" class="tab-content">
+        <div class="section-header">
+          <h2>Blog Posts</h2>
+          <button id="new-post-btn" class="btn btn-primary">New Post</button>
+        </div>
+
+        <!-- Posts List -->
+        <div id="posts-list-view">
+          <div class="card">
+            <div class="table-controls">
+              <select id="post-status-filter">
+                <option value="">All Status</option>
+                <option value="draft">Draft</option>
+                <option value="published">Published</option>
+              </select>
+              <input type="text" id="post-search" placeholder="Search posts...">
+            </div>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Title</th>
+                  <th>Status</th>
+                  <th>Date</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="posts-list-body">
+                <tr><td colspan="4" class="loading-cell">Loading posts...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Post Editor -->
+        <div id="post-editor-view" style="display: none;">
+          <div class="card">
+            <form id="post-form">
+              <input type="hidden" id="post-id">
+              
+              <div class="form-group">
+                <label for="post-title">Title</label>
+                <input type="text" id="post-title" required>
+              </div>
+
+              <div class="form-group">
+                <label for="post-slug">Slug</label>
+                <input type="text" id="post-slug" required>
+              </div>
+
+              <div class="form-group">
+                <label for="post-content">Content</label>
+                <textarea id="post-content" rows="12"></textarea>
+              </div>
+
+              <div class="form-group">
+                <label for="post-excerpt">Excerpt</label>
+                <textarea id="post-excerpt" rows="3"></textarea>
+              </div>
+
+              <div class="form-group">
+                <label>
+                  <input type="checkbox" id="post-draft">
+                  Save as draft
+                </label>
+              </div>
+
+              <div class="form-actions">
+                <button type="button" id="cancel-post-btn" class="btn btn-outline">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Post</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Petitions Tab -->
+      <div id="tab-petitions" class="tab-content">
+        <div class="section-header">
+          <h2>Petitions</h2>
+          <button id="new-petition-btn" class="btn btn-primary">New Petition</button>
+        </div>
+
+        <!-- Petitions List -->
+        <div id="petitions-list-view">
+          <div class="card">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Title</th>
+                  <th>Signatures</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="petitions-list-body">
+                <tr><td colspan="5" class="loading-cell">Loading petitions...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Petition Editor -->
+        <div id="petition-editor-view" style="display: none;">
+          <div class="card">
+            <form id="petition-form">
+              <input type="hidden" id="petition-id">
+              
+              <div class="form-group">
+                <label for="petition-name">Internal Name (ID)</label>
+                <input type="text" id="petition-name" required placeholder="voter-integrity-2026">
+                <small>Lowercase, no spaces. Used in URLs and database.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="petition-title">Display Title</label>
+                <input type="text" id="petition-title" required placeholder="Voter Integrity Petition 2026">
+              </div>
+
+              <div class="form-group">
+                <label for="petition-description">Description</label>
+                <textarea id="petition-description" rows="3"></textarea>
+              </div>
+
+              <div class="form-group">
+                <label for="petition-message">Petition Message</label>
+                <textarea id="petition-message" rows="6"></textarea>
+              </div>
+
+              <div class="form-group">
+                <label>
+                  <input type="checkbox" id="petition-active">
+                  Active (visible on site)
+                </label>
+              </div>
+
+              <div class="form-group">
+                <label>
+                  <input type="checkbox" id="petition-draft">
+                  Save as draft
+                </label>
+              </div>
+
+              <div class="form-actions">
+                <button type="button" id="cancel-petition-btn" class="btn btn-outline">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Petition</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Banner Settings Tab -->
+      <div id="tab-banner" class="tab-content">
+        <div class="section-header">
+          <h2>Homepage Banner</h2>
+        </div>
+
+        <div class="card">
+          <form id="banner-form">
+            <div class="form-group">
+              <label for="banner-text">Banner Text</label>
+              <textarea id="banner-text" rows="2" placeholder="JOIN US FOR SECURE THE VOTE ACT 2026 LOBBY DAY — WED FEB 4 AT 9AM — CLICK HERE TO REGISTER!"></textarea>
+            </div>
+
+            <div class="form-group">
+              <label for="banner-link">Link URL</label>
+              <input type="url" id="banner-link" placeholder="/register-for-lobby-day-jan-27/#register-now">
+            </div>
+
+            <div class="form-group">
+              <label>
+                <input type="checkbox" id="banner-enabled">
+                Banner Enabled
+              </label>
+            </div>
+
+            <div id="banner-message" class="form-message" style="display: none;"></div>
+
+            <button type="submit" class="btn btn-primary">Save Banner Settings</button>
+          </form>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Upload Modal -->
+  <div id="upload-modal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Upload Image</h3>
+        <button class="close-btn" id="close-upload-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="upload-zone" id="upload-zone">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="17 8 12 3 7 8"></polyline>
+            <line x1="12" y1="3" x2="12" y2="15"></line>
+          </svg>
+          <p>Drag & drop an image here, or <label for="file-input" class="browse-link">browse</label></p>
+          <p class="upload-hint">JPG, PNG, GIF, WEBP, SVG (max 10MB)</p>
+          <input type="file" id="file-input" accept="image/*" hidden>
+        </div>
+        <div id="upload-preview" class="upload-preview" style="display: none;">
+          <img id="preview-img" src="" alt="Preview">
+          <span id="preview-name"></span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline" id="cancel-upload-btn">Cancel</button>
+        <button class="btn btn-primary" id="submit-upload-btn" disabled>Upload</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Deployment Modal -->
+  <div id="deployment-modal" class="modal">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content deployment-modal-content">
+      <div class="deployment-header">
+        <h2 id="deployment-title">Deploying Preview</h2>
+      </div>
+      <div class="deployment-body">
+        <div class="deployment-status" id="deployment-status">
+          <div class="spinner"></div>
+          <p id="deployment-message">Initializing...</p>
+        </div>
+      </div>
+      <div class="deployment-footer">
+        <div id="deployment-success" class="deployment-success" style="display: none;">
+          <span class="success-icon">✓</span>
+          <span class="success-text">Deployment complete!</span>
+        </div>
+        <a href="#" id="deployment-cancel" class="cancel-link">Cancel</a>
+        <a href="#" id="deployment-link" class="deployment-link" style="display: none;" target="_blank">Open Site</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- File input for chat attachments -->
+  <input type="file" id="chat-file-input" accept="image/*" hidden>
+
+  <!-- Scripts -->
+  <script src="js/app.js"></script>
+  <script src="js/chat.js"></script>
+  <script src="js/content.js"></script>
+  <script src="js/deploy.js"></script>
+  <script src="js/upload.js"></script>
+</body>
+</html>
