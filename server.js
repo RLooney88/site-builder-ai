@@ -483,6 +483,17 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         }
       },
       {
+        name: 'revert_file',
+        description: 'Revert a file to its version on the main (production) branch, undoing any staging changes.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path to revert (e.g., dist/citizen-action/index.html)' }
+          },
+          required: ['path']
+        }
+      },
+      {
         name: 'list_files',
         description: 'List files in a directory of the GitHub repository.',
         input_schema: {
@@ -552,6 +563,48 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           return `Error writing file: ${err.message}`;
         }
         return `File ${toolInput.path} updated successfully on staging branch.`;
+      }
+
+      if (toolName === 'revert_file') {
+        // Read the file from main (production) branch
+        const mainResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=main`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!mainResp.ok) {
+          const err = await mainResp.json();
+          return `Error reading production version: ${err.message}`;
+        }
+        const mainData = await mainResp.json();
+
+        // Get current staging SHA for the file
+        const stagingResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        const stagingSha = stagingResp.ok ? (await stagingResp.json()).sha : null;
+
+        // Write the main version back to staging
+        const body = {
+          message: `Revert: ${toolInput.path} to production version`,
+          content: mainData.content.replace(/\n/g, ''), // GitHub returns base64 with newlines
+          branch: 'staging'
+        };
+        if (stagingSha) body.sha = stagingSha;
+
+        const writeResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+          {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          }
+        );
+        if (!writeResp.ok) {
+          const err = await writeResp.json();
+          return `Error reverting file: ${err.message}`;
+        }
+        return `File ${toolInput.path} reverted to production version on staging branch.`;
       }
 
       if (toolName === 'list_files') {
