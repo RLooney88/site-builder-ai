@@ -9,7 +9,7 @@ import { dirname, join } from 'path';
 import fs from 'fs/promises';
 import dotenv from 'dotenv';
 import { generateJWT, getCMSBaseURL } from './lib/jwt.js';
-import { createBranch, getVercelPreviewURL, mergeBranch, deleteBranch } from './lib/github.js';
+import { getStagingPreviewURL, publishToProduction } from './lib/github.js';
 
 dotenv.config();
 
@@ -256,29 +256,24 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     
     const session = await getSession(siteId);
     
-    // Create preview branch
-    const branchName = `preview-${Date.now()}`;
+    // Generate staging preview URL
+    // Changes are already pushed to staging branch via updateFile() calls
+    // Extract GitHub username from repo (format: username/repo)
+    const [githubUsername] = site.github_repo.split('/');
+    const previewUrl = getStagingPreviewURL(site.vercel_project, githubUsername);
     
-    console.log(`Creating preview branch: ${branchName}`);
-    
-    await createBranch(site.github_repo, site.github_token, branchName);
-    
-    // Generate Vercel preview URL
-    // Format: https://{project}-git-{branch}.vercel.app
-    const previewUrl = getVercelPreviewURL(site.vercel_project, branchName);
-    
-    console.log(`Preview URL: ${previewUrl}`);
+    console.log(`Staging preview URL: ${previewUrl}`);
     
     // Save edit record
     await pool.query(
       'INSERT INTO edits (session_id, file_path, change_description, preview_url, preview_branch) VALUES ($1, $2, $3, $4, $5)',
-      [session.id, files.join(', ') || 'AI changes', 'Preview deployment', previewUrl, branchName]
+      [session.id, files.join(', ') || 'AI changes', 'Staging preview', previewUrl, 'staging']
     );
     
     res.json({
       previewUrl,
-      branch: branchName,
-      message: 'Preview branch created. Vercel will deploy automatically in ~30 seconds.'
+      branch: 'staging',
+      message: 'Changes are on staging branch. Preview will update automatically in ~30 seconds.'
     });
   } catch (error) {
     console.error('Preview error:', error);
@@ -286,15 +281,10 @@ app.post('/sites/:siteId/preview', async (req, res) => {
   }
 });
 
-// POST /sites/:siteId/approve
-app.post('/sites/:siteId/approve', async (req, res) => {
+// POST /sites/:siteId/publish (formerly /approve)
+app.post('/sites/:siteId/publish', async (req, res) => {
   try {
     const { siteId } = req.params;
-    const { previewBranch } = req.body;
-    
-    if (!previewBranch) {
-      return res.status(400).json({ error: 'Preview branch is required' });
-    }
     
     // Get site
     const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
@@ -303,42 +293,44 @@ app.post('/sites/:siteId/approve', async (req, res) => {
     }
     const site = siteResult.rows[0];
     
-    console.log(`Merging ${previewBranch} to main`);
+    console.log(`Publishing staging to production (main)`);
     
-    // Merge preview branch to main
-    await mergeBranch(
+    // Merge staging to main
+    await publishToProduction(
       site.github_repo, 
-      site.github_token, 
-      previewBranch,
-      `Approve AI changes from ${previewBranch}`
+      site.github_token,
+      'Publish changes from staging to production'
     );
     
-    // Mark as approved
+    // Mark recent staging edits as published
     await pool.query(
-      'UPDATE edits SET approved = true, deployed_at = NOW() WHERE preview_branch = $1',
-      [previewBranch]
+      `UPDATE edits 
+       SET approved = true, deployed_at = NOW() 
+       WHERE session_id IN (SELECT id FROM sessions WHERE site_id = $1)
+       AND preview_branch = 'staging'
+       AND approved = false`,
+      [siteId]
     );
     
-    console.log(`Merged to main. Cleaning up preview branch...`);
-    
-    // Clean up preview branch (optional - can keep for history)
-    try {
-      await deleteBranch(site.github_repo, site.github_token, previewBranch);
-      console.log(`Preview branch ${previewBranch} deleted`);
-    } catch (cleanupError) {
-      console.warn(`Could not delete preview branch: ${cleanupError.message}`);
-      // Non-fatal - continue
-    }
+    console.log(`Staging merged to main. Production deployment starting...`);
     
     res.json({ 
-      status: 'approved', 
-      message: 'Changes merged to production. Vercel will deploy to live site in ~30 seconds.',
-      productionUrl: `https://${site.vercel_project}.vercel.app`
+      status: 'published', 
+      message: 'Changes published to production. Live site will update in ~30 seconds.',
+      productionUrl: `https://${site.domain}`
     });
   } catch (error) {
-    console.error('Approve error:', error);
+    console.error('Publish error:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// Legacy /approve endpoint (redirect to /publish)
+app.post('/sites/:siteId/approve', async (req, res) => {
+  return app.handle(
+    { ...req, url: `/sites/${req.params.siteId}/publish` },
+    res
+  );
 });
 
 // Start server
