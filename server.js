@@ -307,6 +307,29 @@ function buildSystemPrompt(site, cmsApiUrl, jwtToken) {
 
 ${basePrompt}
 
+## ABOUT THIS SITE
+
+This is a STATIC site built from exported WordPress/Elementor pages. There is NO live WordPress backend.
+The files in \`dist/\` are the final HTML files served by Vercel. They are large (often 100KB+) because they include
+inline Elementor CSS and markup. This is normal.
+
+**HOW TO EDIT THESE FILES:**
+- You do NOT need to preserve the Elementor markup. You CAN and SHOULD replace page content wholesale.
+- When editing a page, read the first 300 lines to understand the structure (head, CSS links, header/nav).
+- Keep the existing \`<head>\`, navigation/header, and footer intact.
+- Replace the MAIN CONTENT AREA (the \`<main>\` or main \`<div>\` section) with clean, modern HTML.
+- Use the site's existing CSS classes where possible, or add inline Tailwind-style classes.
+- The result should be a clean, well-structured HTML page that matches the site's look and feel.
+- Do NOT refuse to edit because files are large or complex. Just replace the content section.
+- Do NOT suggest editing in WordPress — there is no WordPress. You are the editor.
+- NEVER give up or present "options" — just make the edit.
+
+**EDITING STRATEGY FOR LARGE FILES:**
+1. Use \`read_file\` to get the first 300 lines (head, nav, styles)
+2. Use \`read_file_section\` to find the footer/closing tags
+3. Construct the new page: keep head + nav from original, write new content, keep footer from original
+4. Use \`write_file\` to save the complete new page
+
 ## YOUR COMMUNICATION STYLE
 
 You are talking to a non-technical website owner. NEVER use developer jargon.
