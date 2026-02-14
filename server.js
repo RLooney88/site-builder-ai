@@ -268,36 +268,46 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     
     // Get actual staging deployment URL from Vercel
     let previewUrl;
-    try {
-      const deploymentsRes = await fetch(`https://api.vercel.com/v6/deployments?projectId=${site.vercel_project_id || site.vercel_project}&limit=20`, {
-        headers: {
-          'Authorization': `Bearer ${site.vercel_token}`
-        }
-      });
-      
-      if (deploymentsRes.ok) {
-        const deploymentsData = await deploymentsRes.json();
-        // Find latest READY deployment for staging branch
-        const stagingDeployment = deploymentsData.deployments.find(d => 
-          d.meta?.githubCommitRef === 'staging' && 
-          (d.state === 'READY' || d.readyState === 'READY')
-        );
+    let deploymentFound = false;
+    
+    if (site.vercel_token && site.vercel_project_id) {
+      try {
+        const deploymentsRes = await fetch(`https://api.vercel.com/v6/deployments?projectId=${site.vercel_project_id}&limit=20`, {
+          headers: {
+            'Authorization': `Bearer ${site.vercel_token}`
+          }
+        });
         
-        if (stagingDeployment) {
-          previewUrl = `https://${stagingDeployment.url}`;
+        if (deploymentsRes.ok) {
+          const deploymentsData = await deploymentsRes.json();
+          // Find latest READY deployment for staging branch
+          const stagingDeployment = deploymentsData.deployments.find(d => 
+            d.meta?.githubCommitRef === 'staging' && 
+            (d.state === 'READY' || d.readyState === 'READY')
+          );
+          
+          if (stagingDeployment) {
+            previewUrl = `https://${stagingDeployment.url}`;
+            deploymentFound = true;
+          }
         }
+      } catch (vercelError) {
+        console.warn('Could not fetch Vercel deployments:', vercelError.message);
       }
-    } catch (vercelError) {
-      console.warn('Could not fetch Vercel deployments:', vercelError.message);
     }
     
-    // Fallback to pattern-based URL if API call fails
+    // Fallback to pattern-based URL if API call fails or no deployment found
     if (!previewUrl) {
       const [githubUsername] = site.github_repo.split('/');
-      previewUrl = getStagingPreviewURL(site.vercel_project, githubUsername);
+      // Use getStagingPreviewURL from lib/github.js
+      previewUrl = `https://${site.vercel_project}-git-staging-${githubUsername}.vercel.app`;
     }
     
-    console.log(`Staging preview URL: ${previewUrl}`);
+    if (!previewUrl || !previewUrl.startsWith('http')) {
+      throw new Error('Could not generate valid preview URL');
+    }
+    
+    console.log(`Staging preview URL: ${previewUrl} (${deploymentFound ? 'from Vercel API' : 'pattern-based'})`);
     
     // Save edit record
     await pool.query(
