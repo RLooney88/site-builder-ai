@@ -345,6 +345,21 @@ For small files (<15KB), you can use \`read_file\` + \`write_file\` directly.
 1. Use \`replace_page_content\` with the new content HTML — done in ONE tool call
 2. Only use read_file/write_file if you need fine-grained control over the entire file
 
+## BRANDING & STYLE GUIDELINES
+
+When creating or editing page content, ALWAYS match the existing site design:
+- **Before editing**, use \`read_file_section\` on another page (like dist/index.html) to see the CSS classes and styling patterns used
+- Copy the same class names, color patterns, and layout structure
+- The site uses custom CSS from Elementor — use the existing class patterns, not generic Tailwind
+- Common patterns: \`elementor-widget-wrap\`, \`elementor-element\`, etc.
+- If unsure about styling, read the site's main CSS file (dist/css/elementor.css) for reference
+- **Colors, fonts, and spacing should match the rest of the site exactly**
+
+**LINK VALIDATION (CRITICAL):**
+- Before creating ANY link to another page on the site, use the \`verify_links\` tool to confirm the page exists
+- Common pages: /petition/, /sign-the-petition/, /contact-us/, /be-an-election-judge/, /citizen-action/
+- NEVER guess at URLs — verify first
+
 ## YOUR COMMUNICATION STYLE
 
 You are talking to a non-technical website owner. NEVER use developer jargon.
@@ -555,6 +570,21 @@ app.post('/sites/:siteId/chat', async (req, res) => {
             message: { type: 'string', description: 'Commit message' }
           },
           required: ['path', 'new_content', 'message']
+        }
+      },
+      {
+        name: 'verify_links',
+        description: 'Check if pages/paths exist in the site repo. Use before creating links to avoid 404s.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            paths: { 
+              type: 'array', 
+              items: { type: 'string' },
+              description: 'Array of URL paths to verify (e.g., ["/petition/", "/contact-us/"])' 
+            }
+          },
+          required: ['paths']
         }
       },
       {
@@ -777,6 +807,26 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         return `Page content replaced successfully. Header (${headerEnd} chars) and footer (${fullContent.length - footerStart} chars) preserved. New content (${toolInput.new_content.length} chars) inserted.`;
       }
 
+      if (toolName === 'verify_links') {
+        // List top-level directories in dist/ to check which pages exist
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/dist?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) return 'Error checking links.';
+        const items = await resp.json();
+        const existingPaths = items.filter(i => i.type === 'dir').map(i => '/' + i.name + '/');
+        existingPaths.push('/'); // Homepage always exists
+        
+        const results = toolInput.paths.map(path => {
+          const normalized = path.endsWith('/') ? path : path + '/';
+          const exists = existingPaths.some(p => p === normalized);
+          return `${path}: ${exists ? 'EXISTS' : 'NOT FOUND'}`;
+        });
+        
+        return results.join('\n') + '\n\nValid pages: ' + existingPaths.join(', ');
+      }
+
       if (toolName === 'revert_file') {
         // Read the file from main (production) branch
         const mainResp = await fetch(
@@ -860,6 +910,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       read_file_section: (input) => `Searching for "${input.search?.slice(0, 30)}" in ${input.path?.split('/').pop() || 'file'}...`,
       write_file: (input) => `Saving changes to ${input.path?.split('/').pop() || 'file'}...`,
       replace_page_content: (input) => `Updating page content in ${input.path?.split('/').pop() || 'page'}...`,
+      verify_links: () => `Checking links...`,
       revert_file: (input) => `Reverting ${input.path?.split('/').pop() || 'file'}...`,
     };
 
