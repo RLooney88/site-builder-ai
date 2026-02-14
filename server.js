@@ -523,6 +523,9 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           return `Error reading file: ${err.message}`;
         }
         const data = await resp.json();
+        if (!data.content) {
+          return `Error: File content not available (file may be too large). Size: ${data.size || 'unknown'} bytes.`;
+        }
         const content = Buffer.from(data.content, 'base64').toString('utf-8');
         // Truncate very large files
         if (content.length > 50000) {
@@ -532,6 +535,9 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'write_file') {
+        if (!toolInput.content) {
+          return 'Error: No content provided for write_file.';
+        }
         // First check if file exists to get SHA
         let sha = null;
         const checkResp = await fetch(
@@ -545,7 +551,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
 
         const body = {
           message: toolInput.message || 'Update file via AI editor',
-          content: Buffer.from(toolInput.content).toString('base64'),
+          content: Buffer.from(toolInput.content, 'utf-8').toString('base64'),
           branch: 'staging'
         };
         if (sha) body.sha = sha;
@@ -652,8 +658,13 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           hasText = true;
         } else if (block.type === 'tool_use') {
           console.log(`Tool call: ${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
-          const result = await executeTool(block.name, block.input);
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+          try {
+            const result = await executeTool(block.name, block.input);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: String(result || 'Tool completed with no output.') });
+          } catch (toolErr) {
+            console.error(`Tool error (${block.name}):`, toolErr.message);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Tool error: ${toolErr.message}`, is_error: true });
+          }
         }
       }
 
