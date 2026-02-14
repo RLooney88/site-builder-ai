@@ -631,11 +631,37 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       return `Unknown tool: ${toolName}`;
     }
 
+    // Check if client wants streaming (SSE)
+    const wantsStream = req.query.stream === 'true' || req.headers.accept === 'text/event-stream';
+
+    // Helper to send SSE status updates
+    let sendStatus;
+    if (wantsStream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      sendStatus = (status) => {
+        res.write(`data: ${JSON.stringify({ type: 'status', status })}\n\n`);
+      };
+    } else {
+      sendStatus = () => {}; // no-op for non-streaming
+    }
+
+    // Friendly tool names for status updates
+    const toolStatusMap = {
+      list_files: (input) => `Browsing ${input.path || 'files'}...`,
+      read_file: (input) => `Reading ${input.path?.split('/').pop() || 'file'}...`,
+      write_file: (input) => `Saving changes to ${input.path?.split('/').pop() || 'file'}...`,
+      revert_file: (input) => `Reverting ${input.path?.split('/').pop() || 'file'}...`,
+    };
+
     // Call Claude with tools — loop until we get a final text response
     let currentMessages = messages;
     let assistantMessage = '';
     let loopCount = 0;
     const MAX_LOOPS = 10;
+
+    sendStatus('Thinking...');
 
     while (loopCount < MAX_LOOPS) {
       loopCount++;
@@ -650,13 +676,13 @@ app.post('/sites/:siteId/chat', async (req, res) => {
 
       // Process response content
       const toolResults = [];
-      let hasText = false;
 
       for (const block of response.content) {
         if (block.type === 'text') {
           assistantMessage += block.text;
-          hasText = true;
         } else if (block.type === 'tool_use') {
+          const friendlyStatus = toolStatusMap[block.name]?.(block.input) || `Running ${block.name}...`;
+          sendStatus(friendlyStatus);
           console.log(`Tool call: ${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
           try {
             const result = await executeTool(block.name, block.input);
@@ -688,10 +714,15 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     // Update session timestamp
     await pool.query('UPDATE sessions SET updated_at = NOW() WHERE id = $1', [session.id]);
     
-    res.json({
-      message: assistantMessage,
-      sessionId: session.id
-    });
+    if (wantsStream) {
+      res.write(`data: ${JSON.stringify({ type: 'done', message: assistantMessage, sessionId: session.id })}\n\n`);
+      res.end();
+    } else {
+      res.json({
+        message: assistantMessage,
+        sessionId: session.id
+      });
+    }
     
   } catch (error) {
     console.error('Chat error:', error);
