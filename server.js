@@ -256,11 +256,36 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     
     const session = await getSession(siteId);
     
-    // Generate staging preview URL
-    // Changes are already pushed to staging branch via updateFile() calls
-    // Extract GitHub username from repo (format: username/repo)
-    const [githubUsername] = site.github_repo.split('/');
-    const previewUrl = getStagingPreviewURL(site.vercel_project, githubUsername);
+    // Get actual staging deployment URL from Vercel
+    let previewUrl;
+    try {
+      const deploymentsRes = await fetch(`https://api.vercel.com/v6/deployments?projectId=${site.vercel_project_id || site.vercel_project}&limit=20`, {
+        headers: {
+          'Authorization': `Bearer ${site.vercel_token}`
+        }
+      });
+      
+      if (deploymentsRes.ok) {
+        const deploymentsData = await deploymentsRes.json();
+        // Find latest READY deployment for staging branch
+        const stagingDeployment = deploymentsData.deployments.find(d => 
+          d.meta?.githubCommitRef === 'staging' && 
+          (d.state === 'READY' || d.readyState === 'READY')
+        );
+        
+        if (stagingDeployment) {
+          previewUrl = `https://${stagingDeployment.url}`;
+        }
+      }
+    } catch (vercelError) {
+      console.warn('Could not fetch Vercel deployments:', vercelError.message);
+    }
+    
+    // Fallback to pattern-based URL if API call fails
+    if (!previewUrl) {
+      const [githubUsername] = site.github_repo.split('/');
+      previewUrl = getStagingPreviewURL(site.vercel_project, githubUsername);
+    }
     
     console.log(`Staging preview URL: ${previewUrl}`);
     
@@ -273,7 +298,7 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     res.json({
       previewUrl,
       branch: 'staging',
-      message: 'Changes are on staging branch. Preview will update automatically in ~30 seconds.'
+      message: 'Staging preview ready. Opens in new tab.'
     });
   } catch (error) {
     console.error('Preview error:', error);
