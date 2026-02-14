@@ -245,18 +245,28 @@ Authorization: Bearer ${jwtToken}
 
 ### STATIC CONTENT (Edit files via GitHub API)
 
-**Pages:** src/*.njk, src/pages/*.njk
-**Templates:** src/_includes/*.njk
-**Styles:** src/css/*.css
-**Scripts:** src/js/*.js
-**Navigation:** src/_includes/header.njk
-**Footer:** src/_includes/footer.njk
+**GitHub Repository:** ${site.github_repo}
+**GitHub Token:** ${site.github_token}
+**Branch:** Always push to \`staging\` branch (never main, never create temporary branches)
 
-**For static content:**
-1. Edit via GitHub API
-2. Create preview branch (preview-YYYY-MM-DD-HHMM)
-3. Vercel auto-deploys preview
-4. Get approval before merging to main
+**Built site files (what Vercel serves):**
+- **Pages:** dist/*.html, dist/*/index.html
+- **Styles:** dist/css/*.css
+- **Scripts:** dist/js/*.js
+- **Images:** dist/images/
+
+**Source files (Eleventy templates — only if the site uses a build step):**
+- **Pages:** src/*.njk, src/pages/*.njk
+- **Templates:** src/_includes/*.njk
+- **Styles:** src/css/*.css
+
+**IMPORTANT:** This site deploys from the \`dist/\` folder. Edit \`dist/\` files directly for immediate effect. Only edit \`src/\` files if you know the site has a build step configured.
+
+**For static content edits:**
+1. Fetch current file from GitHub API (use \`?ref=staging\` to read from staging branch)
+2. Edit the file content
+3. Push updated file to \`staging\` branch via GitHub Contents API
+4. The user will preview via their staging URL and publish when ready
 
 ## ROUTING DECISION TREE
 
@@ -265,18 +275,23 @@ User request → Analyze → Choose route:
 "Add/edit blog post" → CMS API (POST /api/admin/posts)
 "Update banner" → CMS API (PUT /api/admin/banner-settings)
 "Edit petition" → CMS API
-"Change homepage" → GitHub file edit (src/index.njk)
-"Update navigation" → GitHub file edit (src/_includes/header.njk)
-"Change CSS" → GitHub file edit (src/css/*.css)
-"Add new page" → GitHub file edit (create new .njk)
+"Change homepage" → GitHub file edit (dist/index.html)
+"Update navigation" → GitHub file edit (dist/ - find header in HTML files)
+"Change CSS" → GitHub file edit (dist/css/*.css)
+"Add new page" → GitHub file edit (create new dist/page/index.html)
 
 ## RESPONSE FORMAT
 
 After making changes, respond with:
-✅ What was changed
-📍 Where it was changed (CMS vs GitHub)
-🔗 Preview URL (if applicable)
-⏭️ Next steps
+- What was changed
+- Where it was changed (CMS API vs GitHub file edit)
+- Tell the user to click "Preview Edits" to see the changes on the staging site
+
+**CRITICAL RULES:**
+- NEVER create temporary preview branches. Always push to \`staging\`.
+- NEVER hardcode or guess GitHub credentials. Use ONLY the repo and token provided above.
+- When reading files from GitHub, always use \`?ref=staging\` to get the staging version.
+- When writing files, always specify \`branch: "staging"\` in the API call.
 
 Be concise and professional.`;
 }
