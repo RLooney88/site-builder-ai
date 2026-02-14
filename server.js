@@ -161,6 +161,106 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ============================================================
+// Site Management Endpoints (for Aster/admin API access)
+// ============================================================
+
+// GET /sites - List all sites
+app.get('/sites', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, domain, github_repo, vercel_project, vercel_project_id, created_at FROM sites ORDER BY created_at DESC'
+    );
+    res.json({ sites: result.rows });
+  } catch (error) {
+    console.error('List sites error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /sites/:siteId - Get site details
+app.get('/sites/:siteId', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const result = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const site = result.rows[0];
+    // Mask sensitive tokens in response
+    const safe = {
+      id: site.id,
+      domain: site.domain,
+      github_repo: site.github_repo,
+      github_token: site.github_token ? '***' + site.github_token.slice(-6) : null,
+      vercel_project: site.vercel_project,
+      vercel_project_id: site.vercel_project_id,
+      vercel_token: site.vercel_token ? '***' + site.vercel_token.slice(-6) : null,
+      config: site.config,
+      created_at: site.created_at
+    };
+    res.json(safe);
+  } catch (error) {
+    console.error('Get site error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /sites/:siteId/pages - List files in repo (for knowing what content exists)
+app.get('/sites/:siteId/pages', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const result = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const site = result.rows[0];
+    if (!site.github_repo || !site.github_token) {
+      return res.status(400).json({ error: 'Site does not have GitHub configured' });
+    }
+
+    const [owner, repoName] = site.github_repo.split('/');
+    const branch = req.query.branch || 'staging';
+    
+    // Get the file tree from GitHub
+    const treeResponse = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/trees/${branch}?recursive=1`,
+      {
+        headers: {
+          'Authorization': `Bearer ${site.github_token}`,
+          'Accept': 'application/vnd.github.v3+json'
+        }
+      }
+    );
+
+    if (!treeResponse.ok) {
+      const err = await treeResponse.json();
+      return res.status(treeResponse.status).json({ error: err.message });
+    }
+
+    const treeData = await treeResponse.json();
+    
+    // Filter to interesting files (HTML, CSS, JS, images)
+    const pages = [];
+    const assets = [];
+    for (const item of treeData.tree || []) {
+      if (item.type !== 'blob') continue;
+      if (item.path.startsWith('dist/') && item.path.endsWith('.html')) {
+        pages.push({ path: item.path, size: item.size });
+      } else if (item.path.startsWith('dist/css/') || item.path.startsWith('dist/js/')) {
+        assets.push({ path: item.path, size: item.size });
+      }
+    }
+
+    res.json({ pages, assets, totalFiles: treeData.tree?.length || 0 });
+  } catch (error) {
+    console.error('List pages error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+
 // Get or create session
 async function getSession(siteId) {
   const result = await pool.query(
@@ -261,8 +361,8 @@ Authorization: Bearer ${jwtToken}
 ### STATIC CONTENT (Edit files via GitHub API)
 
 **GitHub Repository:** ${site.github_repo}
-**GitHub Token:** ${site.github_token}
-**Branch:** Always push to \`staging\` branch (never main, never create temporary branches)
+**Branch:** Always use the \`staging\` branch (never main, never create temporary branches)
+**Tools:** Use the read_file, write_file, and list_files tools to make changes. Do NOT write fetch() calls or code — use the tools directly.
 
 **Built site files (what Vercel serves):**
 - **Pages:** dist/*.html, dist/*/index.html
@@ -275,13 +375,15 @@ Authorization: Bearer ${jwtToken}
 - **Templates:** src/_includes/*.njk
 - **Styles:** src/css/*.css
 
-**IMPORTANT:** This site deploys from the \`dist/\` folder. Edit \`dist/\` files directly for immediate effect. Only edit \`src/\` files if you know the site has a build step configured.
+**IMPORTANT:** This site deploys from the \`dist/\` folder. Edit \`dist/\` files directly for immediate effect.
 
-**For static content edits:**
-1. Fetch current file from GitHub API (use \`?ref=staging\` to read from staging branch)
-2. Edit the file content
-3. Push updated file to \`staging\` branch via GitHub Contents API
+**For static content edits, use the provided tools:**
+1. Use \`list_files\` to see what files exist in a directory
+2. Use \`read_file\` to get the current content of a file
+3. Use \`write_file\` to update the file on the staging branch
 4. The user will preview via their staging URL and publish when ready
+
+**ALWAYS use the tools to make actual edits. NEVER just describe what you would do — actually do it using the tools.**
 
 ## ROUTING DECISION TREE
 
@@ -308,7 +410,7 @@ After making changes, respond in PLAIN ENGLISH:
 
 **CRITICAL INTERNAL RULES (never mention these to the user):**
 - NEVER create temporary preview branches. Always push to \`staging\`.
-- NEVER hardcode or guess GitHub credentials. Use ONLY the repo and token provided in the system prompt.
+- NEVER write fetch() or JavaScript code. Use the provided tools (read_file, write_file, list_files) to make all changes.
 - When reading files from GitHub, always use \`?ref=staging\` to get the staging version.
 - When writing files, always specify \`branch: "staging"\` in the API call.
 - NEVER ask the user about branches, merging, or deployment. That's handled by the Preview/Publish buttons.
@@ -353,15 +455,168 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       { role: 'user', content: message }
     ];
     
-    // Call Claude
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 4096,
-      system: buildSystemPrompt(site, cmsApiUrl, jwtToken),
-      messages
-    });
-    
-    const assistantMessage = response.content[0].text;
+    // Define tools for Claude to use
+    const tools = [
+      {
+        name: 'read_file',
+        description: 'Read a file from the GitHub repository. Returns the file content.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path in the repo (e.g., dist/index.html)' },
+            branch: { type: 'string', description: 'Branch to read from', default: 'staging' }
+          },
+          required: ['path']
+        }
+      },
+      {
+        name: 'write_file',
+        description: 'Write/update a file in the GitHub repository on the staging branch.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path in the repo (e.g., dist/citizen-action/index.html)' },
+            content: { type: 'string', description: 'The full new content of the file' },
+            message: { type: 'string', description: 'Commit message describing the change' }
+          },
+          required: ['path', 'content', 'message']
+        }
+      },
+      {
+        name: 'list_files',
+        description: 'List files in a directory of the GitHub repository.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Directory path (e.g., dist/ or dist/css/)' },
+            branch: { type: 'string', description: 'Branch to list from', default: 'staging' }
+          },
+          required: ['path']
+        }
+      }
+    ];
+
+    // Tool execution function
+    async function executeTool(toolName, toolInput) {
+      const [owner, repoName] = site.github_repo.split('/');
+      const token = site.github_token;
+
+      if (toolName === 'read_file') {
+        const branch = toolInput.branch || 'staging';
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=${branch}`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        const content = Buffer.from(data.content, 'base64').toString('utf-8');
+        // Truncate very large files
+        if (content.length > 50000) {
+          return content.slice(0, 50000) + '\n\n[... truncated, file is ' + content.length + ' chars]';
+        }
+        return content;
+      }
+
+      if (toolName === 'write_file') {
+        // First check if file exists to get SHA
+        let sha = null;
+        const checkResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (checkResp.ok) {
+          const existing = await checkResp.json();
+          sha = existing.sha;
+        }
+
+        const body = {
+          message: toolInput.message || 'Update file via AI editor',
+          content: Buffer.from(toolInput.content).toString('base64'),
+          branch: 'staging'
+        };
+        if (sha) body.sha = sha;
+
+        const writeResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+          {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          }
+        );
+        if (!writeResp.ok) {
+          const err = await writeResp.json();
+          return `Error writing file: ${err.message}`;
+        }
+        return `File ${toolInput.path} updated successfully on staging branch.`;
+      }
+
+      if (toolName === 'list_files') {
+        const branch = toolInput.branch || 'staging';
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=${branch}`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error listing files: ${err.message}`;
+        }
+        const items = await resp.json();
+        if (!Array.isArray(items)) return 'Path is a file, not a directory.';
+        return items.map(i => `${i.type === 'dir' ? '📁' : '📄'} ${i.name} (${i.size || 'dir'})`).join('\n');
+      }
+
+      return `Unknown tool: ${toolName}`;
+    }
+
+    // Call Claude with tools — loop until we get a final text response
+    let currentMessages = messages;
+    let assistantMessage = '';
+    let loopCount = 0;
+    const MAX_LOOPS = 10;
+
+    while (loopCount < MAX_LOOPS) {
+      loopCount++;
+      
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 4096,
+        system: buildSystemPrompt(site, cmsApiUrl, jwtToken),
+        tools,
+        messages: currentMessages
+      });
+
+      // Process response content
+      const toolResults = [];
+      let hasText = false;
+
+      for (const block of response.content) {
+        if (block.type === 'text') {
+          assistantMessage += block.text;
+          hasText = true;
+        } else if (block.type === 'tool_use') {
+          console.log(`Tool call: ${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
+          const result = await executeTool(block.name, block.input);
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+        }
+      }
+
+      // If Claude wants to use tools, feed results back
+      if (response.stop_reason === 'tool_use' && toolResults.length > 0) {
+        currentMessages = [
+          ...currentMessages,
+          { role: 'assistant', content: response.content },
+          { role: 'user', content: toolResults }
+        ];
+        continue;
+      }
+
+      // Done — Claude gave us a final text response
+      break;
+    }
     
     // Save assistant message
     await saveMessage(session.id, 'assistant', assistantMessage);
