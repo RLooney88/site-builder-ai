@@ -325,10 +325,13 @@ inline Elementor CSS and markup. This is normal.
 - NEVER give up or present "options" — just make the edit.
 
 **EDITING STRATEGY FOR LARGE FILES:**
-1. Use \`read_file\` to get the first 300 lines (head, nav, styles)
-2. Use \`read_file_section\` to find the footer/closing tags
-3. Construct the new page: keep head + nav from original, write new content, keep footer from original
-4. Use \`write_file\` to save the complete new page
+Use the \`replace_page_content\` tool — it's the fastest and most efficient way. You provide ONLY the new HTML content for the main area, and the tool automatically preserves the header/nav/CSS and footer. You don't need to read the whole file first.
+
+For small files (<15KB), you can use \`read_file\` + \`write_file\` directly.
+
+**PREFERRED workflow for page edits:**
+1. Use \`replace_page_content\` with the new content HTML — done in ONE tool call
+2. Only use read_file/write_file if you need fine-grained control over the entire file
 
 ## YOUR COMMUNICATION STYLE
 
@@ -528,6 +531,21 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         }
       },
       {
+        name: 'replace_page_content',
+        description: 'Replace the main content of a page while preserving its header/head and footer. This is the most efficient way to edit large HTML pages. You provide ONLY the new main content HTML — the tool handles reading the existing header and footer and stitching them together.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path (e.g., dist/register-for-lobby-day-jan-27/index.html)' },
+            new_content: { type: 'string', description: 'The new HTML for the main content area. Will be inserted between the header/nav and footer.' },
+            content_start_marker: { type: 'string', description: 'Text that marks where the main content begins (e.g., "main-content" or a unique string near the start of the content area). Default: searches for <main or role="main" or first large content div after nav.' },
+            content_end_marker: { type: 'string', description: 'Text that marks where the main content ends (e.g., "footer" or a unique string near the end). Default: searches for <footer or closing scripts section.' },
+            message: { type: 'string', description: 'Commit message' }
+          },
+          required: ['path', 'new_content', 'message']
+        }
+      },
+      {
         name: 'revert_file',
         description: 'Revert a file to its version on the main (production) branch, undoing any staging changes.',
         input_schema: {
@@ -649,6 +667,104 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         return `File ${toolInput.path} updated successfully on staging branch.`;
       }
 
+      if (toolName === 'replace_page_content') {
+        // Read the current file
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        if (!resp.ok) {
+          const err = await resp.json();
+          return `Error reading file: ${err.message}`;
+        }
+        const data = await resp.json();
+        if (!data.content) return 'File content not available.';
+        const fullContent = Buffer.from(data.content, 'base64').toString('utf-8');
+        const sha = data.sha;
+
+        // Find content boundaries
+        const startMarker = toolInput.content_start_marker || null;
+        const endMarker = toolInput.content_end_marker || null;
+
+        let headerEnd = -1;
+        let footerStart = -1;
+
+        if (startMarker) {
+          headerEnd = fullContent.indexOf(startMarker);
+          if (headerEnd !== -1) {
+            // Go back to the start of the line containing the marker
+            headerEnd = fullContent.lastIndexOf('\n', headerEnd) + 1;
+          }
+        }
+        if (headerEnd === -1) {
+          // Auto-detect: look for end of navigation / start of main content
+          const patterns = ['<main', 'role="main"', 'id="main"', 'class="main"', 'id="content"', 'class="site-main"', '<!-- #content', 'elementor-section-wrap'];
+          for (const p of patterns) {
+            const idx = fullContent.indexOf(p);
+            if (idx !== -1) {
+              headerEnd = fullContent.lastIndexOf('\n', idx) + 1;
+              break;
+            }
+          }
+        }
+        if (headerEnd === -1) {
+          // Last resort: after </nav> or </header>
+          const navEnd = fullContent.lastIndexOf('</nav>');
+          const headerEndTag = fullContent.lastIndexOf('</header>');
+          headerEnd = Math.max(navEnd, headerEndTag);
+          if (headerEnd !== -1) {
+            headerEnd = fullContent.indexOf('\n', headerEnd) + 1;
+          }
+        }
+        if (headerEnd === -1) headerEnd = 0;
+
+        if (endMarker) {
+          footerStart = fullContent.indexOf(endMarker, headerEnd);
+        }
+        if (footerStart === -1) {
+          // Auto-detect footer
+          const footerPatterns = ['<footer', 'id="footer"', 'class="footer"', 'class="site-footer"'];
+          for (const p of footerPatterns) {
+            const idx = fullContent.indexOf(p, headerEnd);
+            if (idx !== -1) {
+              footerStart = fullContent.lastIndexOf('\n', idx) + 1;
+              break;
+            }
+          }
+        }
+        if (footerStart === -1) {
+          // Last resort: before closing </body>
+          footerStart = fullContent.lastIndexOf('</body>');
+          if (footerStart === -1) footerStart = fullContent.length;
+        }
+
+        // Stitch together: header + new content + footer
+        const header = fullContent.slice(0, headerEnd);
+        const footer = fullContent.slice(footerStart);
+        const newPage = header + '\n' + toolInput.new_content + '\n' + footer;
+
+        // Write back
+        const writeBody = {
+          message: toolInput.message || 'Update page content via AI editor',
+          content: Buffer.from(newPage, 'utf-8').toString('base64'),
+          branch: 'staging',
+          sha
+        };
+        const writeResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+          {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+            body: JSON.stringify(writeBody)
+          }
+        );
+        if (!writeResp.ok) {
+          const err = await writeResp.json();
+          return `Error writing file: ${err.message}`;
+        }
+        return `Page content replaced successfully. Header (${headerEnd} chars) and footer (${fullContent.length - footerStart} chars) preserved. New content (${toolInput.new_content.length} chars) inserted.`;
+      }
+
       if (toolName === 'revert_file') {
         // Read the file from main (production) branch
         const mainResp = await fetch(
@@ -731,6 +847,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       read_file: (input) => `Reading ${input.path?.split('/').pop() || 'file'}...`,
       read_file_section: (input) => `Searching for "${input.search?.slice(0, 30)}" in ${input.path?.split('/').pop() || 'file'}...`,
       write_file: (input) => `Saving changes to ${input.path?.split('/').pop() || 'file'}...`,
+      replace_page_content: (input) => `Updating page content in ${input.path?.split('/').pop() || 'page'}...`,
       revert_file: (input) => `Reverting ${input.path?.split('/').pop() || 'file'}...`,
     };
 
@@ -747,7 +864,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-5',
-        max_tokens: 4096,
+        max_tokens: 16384,
         system: [{ type: 'text', text: buildSystemPrompt(site, cmsApiUrl, jwtToken), cache_control: { type: 'ephemeral' } }],
         tools,
         messages: currentMessages
