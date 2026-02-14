@@ -156,6 +156,18 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
+// Request logging
+app.use((req, res, next) => {
+  if (req.path === '/health') return next(); // Skip health checks
+  const start = Date.now();
+  console.log(`→ ${req.method} ${req.path}`);
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`← ${req.method} ${req.path} ${res.statusCode} (${duration}ms)`);
+  });
+  next();
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -857,6 +869,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
     let loopCount = 0;
     const MAX_LOOPS = 25;
 
+    console.log(`[Chat] Site: ${siteId} | Message: "${message.slice(0, 80)}..." | History: ${history.length} msgs`);
     sendStatus('Thinking...');
 
     while (loopCount < MAX_LOOPS) {
@@ -883,7 +896,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         } else if (block.type === 'tool_use') {
           const friendlyStatus = toolStatusMap[block.name]?.(block.input) || `Running ${block.name}...`;
           sendStatus(friendlyStatus);
-          console.log(`Tool call: ${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
+          console.log(`[Tool] ${block.name}: ${JSON.stringify(block.input).slice(0, 300)}`);
           try {
             const result = await executeTool(block.name, block.input);
             toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: String(result || 'Tool completed with no output.') });
@@ -907,6 +920,8 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       // Done — Claude gave us a final text response
       break;
     }
+    
+    console.log(`[Chat] Complete: ${loopCount} turns, response: ${assistantMessage.length} chars`);
     
     // Save assistant message
     await saveMessage(session.id, 'assistant', assistantMessage);
