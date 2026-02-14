@@ -458,6 +458,100 @@ app.post('/sites/:siteId/brand/scan', async (req, res) => {
   }
 });
 
+// POST /sites/:siteId/cache-layout — Extract and cache header/footer from a reference page
+app.post('/sites/:siteId/cache-layout', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const referencePage = req.body.page || 'dist/index.html';
+    
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) return res.status(404).json({ error: 'Site not found' });
+    const site = siteResult.rows[0];
+    
+    const [owner, repoName] = site.github_repo.split('/');
+    const resp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/contents/${referencePage}?ref=main`,
+      { headers: { 'Authorization': `Bearer ${site.github_token}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    if (!resp.ok) return res.status(400).json({ error: 'Could not read reference page' });
+    const data = await resp.json();
+    const content = Buffer.from(data.content, 'base64').toString('utf-8');
+    
+    // Extract header (everything up to main content)
+    const { header, footer } = extractHeaderFooter(content);
+    
+    await pool.query(
+      'UPDATE sites SET cached_header = $1, cached_footer = $2 WHERE id = $3',
+      [header, footer, siteId]
+    );
+    
+    console.log(`[Cache] Layout cached for ${siteId}: header=${header.length} chars, footer=${footer.length} chars`);
+    res.json({ success: true, headerLength: header.length, footerLength: footer.length });
+  } catch (error) {
+    console.error('Cache layout error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper: extract header and footer from full HTML page
+function extractHeaderFooter(content) {
+  let headerEnd = -1;
+  let footerStart = -1;
+  
+  // Find end of header/nav
+  const headerPatterns = ['<main', 'role="main"', 'id="main"', 'class="main"', 'id="content"', 'class="site-main"', 'elementor-section-wrap'];
+  for (const p of headerPatterns) {
+    const idx = content.indexOf(p);
+    if (idx !== -1) {
+      headerEnd = content.lastIndexOf('\n', idx) + 1;
+      break;
+    }
+  }
+  if (headerEnd === -1) {
+    const navEnd = content.lastIndexOf('</nav>');
+    const headerEndTag = content.lastIndexOf('</header>');
+    headerEnd = Math.max(navEnd, headerEndTag);
+    if (headerEnd !== -1) headerEnd = content.indexOf('\n', headerEnd) + 1;
+  }
+  if (headerEnd === -1) headerEnd = 0;
+  
+  // Find start of footer
+  const footerPatterns = ['<footer', 'id="footer"', 'class="footer"', 'class="site-footer"'];
+  for (const p of footerPatterns) {
+    const idx = content.indexOf(p, headerEnd);
+    if (idx !== -1) {
+      footerStart = content.lastIndexOf('\n', idx) + 1;
+      break;
+    }
+  }
+  if (footerStart === -1) {
+    footerStart = content.lastIndexOf('</body>');
+    if (footerStart === -1) footerStart = content.length;
+  }
+  
+  return {
+    header: content.slice(0, headerEnd),
+    footer: content.slice(footerStart)
+  };
+}
+
+// GET /sites/:siteId/layout — Get cached header/footer
+app.get('/sites/:siteId/layout', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const result = await pool.query('SELECT cached_header, cached_footer FROM sites WHERE id = $1', [siteId]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Site not found' });
+    const { cached_header, cached_footer } = result.rows[0];
+    res.json({ 
+      cached: !!(cached_header && cached_footer),
+      headerLength: cached_header?.length || 0,
+      footerLength: cached_footer?.length || 0
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============================================================
 
 // Get or create session
@@ -934,79 +1028,53 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'replace_page_content') {
-        // Read the current file
+        // Check for cached header/footer first
+        const siteData = await pool.query('SELECT cached_header, cached_footer FROM sites WHERE id = $1', [req.params.siteId]);
+        const cachedHeader = siteData.rows[0]?.cached_header;
+        const cachedFooter = siteData.rows[0]?.cached_footer;
+        
+        // Get the current file SHA (needed for the update)
         const resp = await fetch(
           `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
           { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
         );
-        if (!resp.ok) {
-          const err = await resp.json();
-          return `Error reading file: ${err.message}`;
-        }
-        const data = await resp.json();
-        if (!data.content) return 'File content not available.';
-        const fullContent = Buffer.from(data.content, 'base64').toString('utf-8');
-        const sha = data.sha;
-
-        // Find content boundaries
-        const startMarker = toolInput.content_start_marker || null;
-        const endMarker = toolInput.content_end_marker || null;
-
-        let headerEnd = -1;
-        let footerStart = -1;
-
-        if (startMarker) {
-          headerEnd = fullContent.indexOf(startMarker);
-          if (headerEnd !== -1) {
-            // Go back to the start of the line containing the marker
-            headerEnd = fullContent.lastIndexOf('\n', headerEnd) + 1;
+        
+        let sha = null;
+        let header, footer;
+        
+        if (cachedHeader && cachedFooter) {
+          // Use cached header/footer — much faster, no need to parse
+          console.log(`[Tool] Using cached header (${cachedHeader.length} chars) and footer (${cachedFooter.length} chars)`);
+          header = cachedHeader;
+          footer = cachedFooter;
+          if (resp.ok) {
+            const data = await resp.json();
+            sha = data.sha;
           }
-        }
-        if (headerEnd === -1) {
-          // Auto-detect: look for end of navigation / start of main content
-          const patterns = ['<main', 'role="main"', 'id="main"', 'class="main"', 'id="content"', 'class="site-main"', '<!-- #content', 'elementor-section-wrap'];
-          for (const p of patterns) {
-            const idx = fullContent.indexOf(p);
-            if (idx !== -1) {
-              headerEnd = fullContent.lastIndexOf('\n', idx) + 1;
-              break;
-            }
+        } else {
+          // No cache — parse from the current file
+          if (!resp.ok) {
+            const err = await resp.json();
+            return `Error reading file: ${err.message}`;
           }
-        }
-        if (headerEnd === -1) {
-          // Last resort: after </nav> or </header>
-          const navEnd = fullContent.lastIndexOf('</nav>');
-          const headerEndTag = fullContent.lastIndexOf('</header>');
-          headerEnd = Math.max(navEnd, headerEndTag);
-          if (headerEnd !== -1) {
-            headerEnd = fullContent.indexOf('\n', headerEnd) + 1;
-          }
-        }
-        if (headerEnd === -1) headerEnd = 0;
-
-        if (endMarker) {
-          footerStart = fullContent.indexOf(endMarker, headerEnd);
-        }
-        if (footerStart === -1) {
-          // Auto-detect footer
-          const footerPatterns = ['<footer', 'id="footer"', 'class="footer"', 'class="site-footer"'];
-          for (const p of footerPatterns) {
-            const idx = fullContent.indexOf(p, headerEnd);
-            if (idx !== -1) {
-              footerStart = fullContent.lastIndexOf('\n', idx) + 1;
-              break;
-            }
-          }
-        }
-        if (footerStart === -1) {
-          // Last resort: before closing </body>
-          footerStart = fullContent.lastIndexOf('</body>');
-          if (footerStart === -1) footerStart = fullContent.length;
+          const data = await resp.json();
+          if (!data.content) return 'File content not available.';
+          const fullContent = Buffer.from(data.content, 'base64').toString('utf-8');
+          sha = data.sha;
+          
+          const extracted = extractHeaderFooter(fullContent);
+          header = extracted.header;
+          footer = extracted.footer;
+          
+          // Auto-cache for next time
+          await pool.query(
+            'UPDATE sites SET cached_header = $1, cached_footer = $2 WHERE id = $3',
+            [header, footer, req.params.siteId]
+          );
+          console.log(`[Tool] Auto-cached header/footer for ${req.params.siteId}`);
         }
 
         // Stitch together: header + new content + footer
-        const header = fullContent.slice(0, headerEnd);
-        const footer = fullContent.slice(footerStart);
         const newPage = header + '\n' + toolInput.new_content + '\n' + footer;
 
         // Write back
