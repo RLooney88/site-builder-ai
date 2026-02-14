@@ -489,6 +489,120 @@ app.post('/sites/:siteId/approve', async (req, res) => {
   );
 });
 
+// ============================================================
+// Storage Abstraction Layer (Swappable for Google Drive)
+// ============================================================
+
+/**
+ * Upload a file to storage. Currently uses GitHub, swappable for Google Drive.
+ * @param {Object} site - Site object with github_repo and github_token
+ * @param {string} siteId - Site identifier for folder organization
+ * @param {Object} file - Multer file object
+ * @returns {Promise<Object>} - { url, path, name, size }
+ */
+async function uploadFileToStorage(site, siteId, file) {
+  const now = new Date();
+  const year = String(now.getFullYear());
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const uploadPath = `dist/uploads/${siteId}/${year}/${month}/${file.originalname}`;
+  
+  // Convert file buffer to base64
+  const fileContent = file.buffer.toString('base64');
+  
+  // Commit file to GitHub staging branch
+  const [owner, repoName] = site.github_repo.split('/');
+  
+  const ghResponse = await fetch(
+    `https://api.github.com/repos/${owner}/${repoName}/contents/${uploadPath}`,
+    {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${site.github_token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: `Upload: ${file.originalname}`,
+        content: fileContent,
+        branch: 'staging'
+      })
+    }
+  );
+  
+  if (!ghResponse.ok) {
+    const ghError = await ghResponse.json();
+    throw new Error(`GitHub upload failed: ${ghError.message}`);
+  }
+  
+  // Return the public URL path
+  const publicUrl = `/uploads/${siteId}/${year}/${month}/${file.originalname}`;
+  
+  return {
+    url: publicUrl,
+    path: uploadPath,
+    name: file.originalname,
+    size: file.size,
+    type: file.mimetype
+  };
+}
+
+/**
+ * List files for a site from storage.
+ * @param {Object} site - Site object with github_repo and github_token
+ * @param {string} siteId - Site identifier for folder filtering
+ * @returns {Promise<Array>} - Array of { name, path, url, size, sha }
+ */
+async function listSiteFiles(site, siteId) {
+  const [owner, repoName] = site.github_repo.split('/');
+  const files = [];
+  
+  try {
+    const treeResponse = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/trees/staging:dist/uploads?recursive=1`,
+      {
+        headers: {
+          'Authorization': `Bearer ${site.github_token}`,
+          'Accept': 'application/vnd.github.v3+json'
+        }
+      }
+    );
+    
+    if (treeResponse.ok) {
+      const treeData = await treeResponse.json();
+      const prefix = `dist/uploads/${siteId}/`;
+      
+      for (const item of treeData.tree || []) {
+        if (item.type === 'blob' && item.path.startsWith(prefix)) {
+          const relativePath = item.path.slice(prefix.length);
+          const pathParts = relativePath.split('/');
+          if (pathParts.length < 2) continue; // Need YYYY/MM/filename
+          const year = pathParts[0];
+          const month = pathParts[1];
+          const filename = pathParts.slice(2).join('/');
+          
+          files.push({
+            name: filename,
+            path: item.path,
+            url: `/uploads/${siteId}/${year}/${month}/${filename}`,
+            size: item.size,
+            sha: item.sha
+          });
+        }
+      }
+      
+      files.sort((a, b) => b.path.localeCompare(a.path));
+    }
+  } catch (treeError) {
+    console.warn('Could not fetch uploads tree:', treeError.message);
+  }
+  
+  return files;
+}
+
+// ============================================================
+// End Storage Abstraction Layer
+// ============================================================
+
 // Multer configuration for file uploads (memory storage)
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -509,7 +623,7 @@ const upload = multer({
   }
 });
 
-// POST /sites/:siteId/upload - Upload a file to the site's GitHub repo
+// POST /sites/:siteId/upload - Upload a file to shared storage
 app.post('/sites/:siteId/upload', upload.single('file'), async (req, res) => {
   try {
     const { siteId } = req.params;
@@ -518,7 +632,7 @@ app.post('/sites/:siteId/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No file provided' });
     }
     
-    // Get site
+    // Get site (for GitHub connection)
     const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
     if (siteResult.rows.length === 0) {
       return res.status(404).json({ error: 'Site not found' });
@@ -529,49 +643,12 @@ app.post('/sites/:siteId/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Site does not have GitHub repository configured' });
     }
     
-    const file = req.file;
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const uploadPath = `dist/uploads/${year}/${month}/${file.originalname}`;
-    
-    // Commit file to GitHub staging branch using Contents API directly
-    // (updateFile double-encodes base64, so we call GitHub API directly for binary files)
-    const [owner, repoName] = site.github_repo.split('/');
-    const fileBase64 = file.buffer.toString('base64');
-    
-    const ghResponse = await fetch(
-      `https://api.github.com/repos/${owner}/${repoName}/contents/${uploadPath}`,
-      {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${site.github_token}`,
-          'Accept': 'application/vnd.github.v3+json',
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          message: `Upload: ${file.originalname}`,
-          content: fileBase64,
-          branch: 'staging'
-        })
-      }
-    );
-    
-    if (!ghResponse.ok) {
-      const ghError = await ghResponse.json();
-      throw new Error(`GitHub upload failed: ${ghError.message}`);
-    }
-    
-    // Return the public URL path
-    const publicUrl = `/uploads/${year}/${month}/${file.originalname}`;
+    // Use abstracted storage layer (swappable for Google Drive)
+    const result = await uploadFileToStorage(site, siteId, req.file);
     
     res.json({
       success: true,
-      url: publicUrl,
-      path: uploadPath,
-      name: file.originalname,
-      size: file.size,
-      type: file.mimetype
+      ...result
     });
     
   } catch (error) {
@@ -580,12 +657,12 @@ app.post('/sites/:siteId/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// GET /sites/:siteId/uploads - List uploaded files
+// GET /sites/:siteId/uploads - List uploaded files for a site
 app.get('/sites/:siteId/uploads', async (req, res) => {
   try {
     const { siteId } = req.params;
     
-    // Get site
+    // Get site (for GitHub connection)
     const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
     if (siteResult.rows.length === 0) {
       return res.status(404).json({ error: 'Site not found' });
@@ -596,53 +673,11 @@ app.get('/sites/:siteId/uploads', async (req, res) => {
       return res.status(400).json({ error: 'Site does not have GitHub repository configured' });
     }
     
-    const [owner, repoName] = site.github_repo.split('/');
-    const uploads = [];
-    
-    // Try to get the tree of dist/uploads/
-    try {
-      const treeResponse = await fetch(
-        `https://api.github.com/repos/${owner}/${repoName}/git/trees/staging:dist/uploads?recursive=1`,
-        {
-          headers: {
-            'Authorization': `Bearer ${site.github_token}`,
-            'Accept': 'application/vnd.github.v3+json'
-          }
-        }
-      );
-      
-      if (treeResponse.ok) {
-        const treeData = await treeResponse.json();
-        
-        // Filter for files (not directories) and build upload list
-        // Tree paths are relative to dist/uploads/, e.g. "2026/02/image.png"
-        for (const item of treeData.tree || []) {
-          if (item.type === 'blob') {
-            const pathParts = item.path.split('/');
-            if (pathParts.length < 3) continue; // Need YYYY/MM/filename
-            const year = pathParts[0];
-            const month = pathParts[1];
-            const filename = pathParts[pathParts.length - 1];
-            
-            uploads.push({
-              name: filename,
-              path: item.path,
-              url: `/uploads/${year}/${month}/${filename}`,
-              size: item.size,
-              sha: item.sha
-            });
-          }
-        }
-        
-        // Sort by path descending (newest first)
-        uploads.sort((a, b) => b.path.localeCompare(a.path));
-      }
-    } catch (treeError) {
-      console.warn('Could not fetch uploads tree:', treeError.message);
-    }
+    // Use abstracted storage layer
+    const files = await listSiteFiles(site, siteId);
     
     res.json({
-      files: uploads
+      files
     });
     
   } catch (error) {
