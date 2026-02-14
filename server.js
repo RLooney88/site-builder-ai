@@ -280,11 +280,13 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     
     if (site.vercel_token && site.vercel_project_id) {
       try {
+        console.log(`Querying Vercel API: projectId=${site.vercel_project_id}, token=${site.vercel_token.substring(0, 10)}...`);
         const deploymentsRes = await fetch(`https://api.vercel.com/v6/deployments?projectId=${site.vercel_project_id}&limit=20`, {
           headers: {
             'Authorization': `Bearer ${site.vercel_token}`
           }
         });
+        console.log(`Vercel API response: ${deploymentsRes.status}`);
         
         if (deploymentsRes.ok) {
           const deploymentsData = await deploymentsRes.json();
@@ -306,9 +308,11 @@ app.post('/sites/:siteId/preview', async (req, res) => {
     
     // Fallback to pattern-based URL if API call fails or no deployment found
     if (!previewUrl) {
-      const [githubUsername] = site.github_repo.split('/');
-      // Use getStagingPreviewURL from lib/github.js
-      previewUrl = `https://${site.vercel_project}-git-staging-${githubUsername}.vercel.app`;
+      // Vercel uses team/account slug, not GitHub username
+      // For personal accounts: {project}-git-staging-{vercel-username}.vercel.app
+      // Store the correct slug in site config, or use a known default
+      const vercelSlug = site.config?.vercelSlug || 'rcl-integrated';
+      previewUrl = `https://${site.vercel_project}-git-staging-${vercelSlug}.vercel.app`;
     }
     
     if (!previewUrl || !previewUrl.startsWith('http')) {
