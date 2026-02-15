@@ -2286,6 +2286,49 @@ app.post('/sites/:siteId/push-to-staging', async (req, res) => {
     
     console.log(`[push-to-staging] Successfully pushed ${pendingEdits.length} edits to staging (commit ${newCommitSha.slice(0, 7)})`);
     
+    // Trigger Vercel deployment via deploy hook (webhook is broken)
+    const deployHookUrl = site.config?.stagingDeployHook;
+    if (deployHookUrl) {
+      try {
+        const hookResp = await fetch(deployHookUrl, { method: 'POST' });
+        const hookData = await hookResp.json();
+        console.log(`[push-to-staging] Triggered Vercel deploy hook: ${hookData?.job?.id || 'ok'}`);
+      } catch (hookErr) {
+        console.error(`[push-to-staging] Deploy hook failed (non-fatal): ${hookErr.message}`);
+      }
+    } else if (site.vercel_token && site.vercel_project_id) {
+      // Fallback: trigger deploy via Vercel API
+      try {
+        const deployResp = await fetch(`https://api.vercel.com/v13/deployments`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${site.vercel_token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            name: site.vercel_project,
+            project: site.vercel_project_id,
+            target: 'preview',
+            gitSource: {
+              type: 'github',
+              repo: site.github_repo.split('/')[1],
+              org: site.github_repo.split('/')[0],
+              ref: 'staging'
+            }
+          })
+        });
+        if (deployResp.ok) {
+          const deployData = await deployResp.json();
+          console.log(`[push-to-staging] Triggered Vercel deployment: ${deployData.id}`);
+        } else {
+          const deployErr = await deployResp.text();
+          console.error(`[push-to-staging] Vercel deploy API failed: ${deployErr}`);
+        }
+      } catch (vercelErr) {
+        console.error(`[push-to-staging] Vercel deploy failed (non-fatal): ${vercelErr.message}`);
+      }
+    }
+    
     // Generate preview URL
     const vercelSlug = site.config?.vercelSlug || 'rcl-integrated';
     const previewUrl = `https://${site.vercel_project}-git-staging-${vercelSlug}.vercel.app`;
@@ -2447,6 +2490,29 @@ app.post('/sites/:siteId/publish', async (req, res) => {
     );
     
     console.log(`Staging merged to main. Production deployment starting...`);
+    
+    // Trigger Vercel production deploy (webhook is broken)
+    const prodDeployHook = site.config?.prodDeployHook;
+    if (prodDeployHook) {
+      try {
+        await fetch(prodDeployHook, { method: 'POST' });
+        console.log('[publish] Triggered production deploy hook');
+      } catch (e) { console.error('[publish] Deploy hook failed:', e.message); }
+    } else if (site.vercel_token && site.vercel_project_id) {
+      try {
+        await fetch(`https://api.vercel.com/v13/deployments`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${site.vercel_token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: site.vercel_project,
+            project: site.vercel_project_id,
+            target: 'production',
+            gitSource: { type: 'github', repo: site.github_repo.split('/')[1], org: site.github_repo.split('/')[0], ref: 'main' }
+          })
+        });
+        console.log('[publish] Triggered Vercel production deployment');
+      } catch (e) { console.error('[publish] Vercel deploy failed:', e.message); }
+    }
     
     res.json({ 
       status: 'published', 
