@@ -1259,26 +1259,18 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         const cachedHeader = siteData.rows[0]?.cached_header;
         const cachedFooter = siteData.rows[0]?.cached_footer;
         
-        // Get the current file SHA (needed for the update)
-        const resp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        
-        let sha = null;
         let header, footer;
         
         if (cachedHeader && cachedFooter) {
-          // Use cached header/footer — much faster, no need to parse
           console.log(`[Tool] Using cached header (${cachedHeader.length} chars) and footer (${cachedFooter.length} chars)`);
           header = cachedHeader;
           footer = cachedFooter;
-          if (resp.ok) {
-            const data = await resp.json();
-            sha = data.sha;
-          }
         } else {
-          // No cache — parse from the current file
+          // No cache — read current file and parse
+          const resp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
           if (!resp.ok) {
             const err = await resp.json();
             return `Error reading file: ${err.message}`;
@@ -1286,13 +1278,11 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           const data = await resp.json();
           if (!data.content) return 'File content not available.';
           const fullContent = Buffer.from(data.content, 'base64').toString('utf-8');
-          sha = data.sha;
           
           const extracted = extractHeaderFooter(fullContent);
           header = extracted.header;
           footer = extracted.footer;
           
-          // Auto-cache for next time
           await pool.query(
             'UPDATE sites SET cached_header = $1, cached_footer = $2 WHERE id = $3',
             [header, footer, req.params.siteId]
@@ -1300,29 +1290,34 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           console.log(`[Tool] Auto-cached header/footer for ${req.params.siteId}`);
         }
 
-        // Stitch together: header + new content + footer
         const newPage = header + '\n' + toolInput.new_content + '\n' + footer;
 
-        // Write back
-        const writeBody = {
-          message: toolInput.message || 'Update page content via AI editor',
-          content: Buffer.from(newPage, 'utf-8').toString('base64'),
-          branch: 'staging',
-          sha
-        };
-        const writeResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
-          {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-            body: JSON.stringify(writeBody)
-          }
-        );
-        if (!writeResp.ok) {
-          const err = await writeResp.json();
-          return `Error writing file: ${err.message}`;
+        // Save to pending_edits instead of GitHub
+        try {
+          await pool.query(
+            `INSERT INTO pending_edits (site_id, session_id, file_path, content, change_description, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')
+             ON CONFLICT (site_id, file_path, status) 
+             DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
+            [req.params.siteId, session.id, toolInput.path, newPage, toolInput.message || 'Update page content via AI editor']
+          );
+          console.log(`[replace_page_content] Saved to pending_edits: ${toolInput.path} (${newPage.length} chars)`);
+          return `Page content replaced successfully. New content (${toolInput.new_content.length} chars) inserted with header and footer preserved. Click "Preview Edits" to see changes.`;
+        } catch (dbError) {
+          console.warn(`[replace_page_content] pending_edits not available, falling back to GitHub: ${dbError.message}`);
+          const resp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          const sha = resp.ok ? (await resp.json()).sha : null;
+          const writeBody = { message: toolInput.message || 'Update page content', content: Buffer.from(newPage, 'utf-8').toString('base64'), branch: 'staging' };
+          if (sha) writeBody.sha = sha;
+          await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+            { method: 'PUT', headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' }, body: JSON.stringify(writeBody) }
+          );
+          return `Page content replaced successfully.`;
         }
-        return `Page content replaced successfully. Header (${headerEnd} chars) and footer (${fullContent.length - footerStart} chars) preserved. New content (${toolInput.new_content.length} chars) inserted.`;
       }
 
       if (toolName === 'verify_links') {
@@ -1467,56 +1462,79 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'search_and_replace') {
-        const resp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        if (!resp.ok) {
-          const err = await resp.json();
-          return `Error reading file: ${err.message}`;
+        // Read file — check pending_edits first, then GitHub
+        let content;
+        try {
+          const pendingResult = await pool.query(
+            'SELECT content FROM pending_edits WHERE site_id = $1 AND file_path = $2 AND status = $3 ORDER BY created_at DESC LIMIT 1',
+            [req.params.siteId, toolInput.path, 'pending']
+          );
+          if (pendingResult.rows.length > 0) {
+            content = pendingResult.rows[0].content;
+            console.log(`[search_and_replace] Reading from pending_edits: ${toolInput.path}`);
+          }
+        } catch (dbError) {
+          console.log(`[search_and_replace] pending_edits not available: ${dbError.message}`);
         }
-        const data = await resp.json();
-        if (!data.content) return 'File content not available.';
         
-        let content = Buffer.from(data.content, 'base64').toString('utf-8');
+        if (!content) {
+          const resp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          if (!resp.ok) {
+            const err = await resp.json();
+            return `Error reading file: ${err.message}`;
+          }
+          const data = await resp.json();
+          if (!data.content) return 'File content not available.';
+          content = Buffer.from(data.content, 'base64').toString('utf-8');
+        }
+        
         const replaceAll = toolInput.all !== false;
         
-        // Find count of matches
         const occurrences = content.split(toolInput.search).length - 1;
         if (occurrences === 0) {
           return `Search text "${toolInput.search}" not found in ${toolInput.path}. Use read_file_section to find the exact text first.`;
         }
         
-        // Replace occurrences
         if (replaceAll) {
           content = content.split(toolInput.search).join(toolInput.replace);
         } else {
           content = content.replace(toolInput.search, toolInput.replace);
         }
         
-        // Write back
-        const body = {
-          message: toolInput.message || `Replace text in ${toolInput.path}`,
-          content: Buffer.from(content, 'utf-8').toString('base64'),
-          branch: 'staging',
-          sha: data.sha
-        };
-        
-        const writeResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
-          {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-          }
-        );
-        if (!writeResp.ok) {
-          const err = await writeResp.json();
-          return `Error writing file: ${err.message}`;
+        // Save to pending_edits instead of GitHub
+        try {
+          await pool.query(
+            `INSERT INTO pending_edits (site_id, session_id, file_path, content, change_description, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')
+             ON CONFLICT (site_id, file_path, status) 
+             DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
+            [req.params.siteId, session.id, toolInput.path, content, toolInput.message || `Replace text in ${toolInput.path}`]
+          );
+          const replacedCount = replaceAll ? occurrences : 1;
+          return `Successfully replaced ${replacedCount} occurrence${replacedCount !== 1 ? 's' : ''} of "${toolInput.search}" in ${toolInput.path}. Click "Preview Edits" to see changes.`;
+        } catch (dbError) {
+          console.warn(`[search_and_replace] pending_edits not available, falling back to GitHub: ${dbError.message}`);
+          const resp2 = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          const data2 = resp2.ok ? await resp2.json() : {};
+          const body = {
+            message: toolInput.message || `Replace text in ${toolInput.path}`,
+            content: Buffer.from(content, 'utf-8').toString('base64'),
+            branch: 'staging',
+            sha: data2.sha
+          };
+          await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+            { method: 'PUT', headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+          );
+          const replacedCount = replaceAll ? occurrences : 1;
+          return `Successfully replaced ${replacedCount} occurrence${replacedCount !== 1 ? 's' : ''} of "${toolInput.search}" in ${toolInput.path}`;
         }
-        
-        const replacedCount = replaceAll ? occurrences : 1;
-        return `Successfully replaced ${replacedCount} occurrence${replacedCount !== 1 ? 's' : ''} of "${toolInput.search}" in ${toolInput.path}`;
       }
 
       if (toolName === 'get_page_styles') {
@@ -1595,38 +1613,36 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         if (!templateData.content) return 'Template content not available.';
         const templateContent = Buffer.from(templateData.content, 'base64').toString('utf-8');
         
-        // Extract header/footer from template
         const extracted = extractHeaderFooter(templateContent);
         let header = extracted.header;
         const footer = extracted.footer;
         
-        // Update title in header
         header = header.replace(/<title>[^<]*<\/title>/i, `<title>${toolInput.title}</title>`);
-        
-        // Construct new page
         const newPage = header + '\n' + toolInput.content + '\n' + footer;
         
-        // Write new page
-        const body = {
-          message: toolInput.message || `Create new page: ${toolInput.new_path}`,
-          content: Buffer.from(newPage, 'utf-8').toString('base64'),
-          branch: 'staging'
-        };
-        
-        const writeResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.new_path}`,
-          {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-          }
-        );
-        if (!writeResp.ok) {
-          const err = await writeResp.json();
-          return `Error creating page: ${err.message}`;
+        // Save to pending_edits instead of GitHub
+        try {
+          await pool.query(
+            `INSERT INTO pending_edits (site_id, session_id, file_path, content, change_description, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')
+             ON CONFLICT (site_id, file_path, status) 
+             DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
+            [req.params.siteId, session.id, toolInput.new_path, newPage, toolInput.message || `Create new page: ${toolInput.new_path}`]
+          );
+          return `New page created at ${toolInput.new_path} with title "${toolInput.title}". Click "Preview Edits" to see it.`;
+        } catch (dbError) {
+          console.warn(`[create_page] pending_edits not available, falling back to GitHub: ${dbError.message}`);
+          const body = {
+            message: toolInput.message || `Create new page: ${toolInput.new_path}`,
+            content: Buffer.from(newPage, 'utf-8').toString('base64'),
+            branch: 'staging'
+          };
+          await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.new_path}`,
+            { method: 'PUT', headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+          );
+          return `New page created at ${toolInput.new_path} with title "${toolInput.title}".`;
         }
-        
-        return `New page created at ${toolInput.new_path} with title "${toolInput.title}". Header, nav, and footer from template preserved.`;
       }
 
       if (toolName === 'validate_html') {
