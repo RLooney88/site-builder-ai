@@ -965,6 +965,33 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
     ];
 
+    // Load custom tools from site config if defined
+    if (site.config && site.config.custom_tools && Array.isArray(site.config.custom_tools)) {
+      for (const customTool of site.config.custom_tools) {
+        if (customTool.name && customTool.description && customTool.query) {
+          const toolDef = {
+            name: customTool.name,
+            description: customTool.description,
+            input_schema: {
+              type: 'object',
+              properties: {},
+              required: customTool.params || []
+            }
+          };
+          
+          // Build parameter properties
+          if (customTool.params && customTool.params.length > 0) {
+            toolDef.input_schema.properties = Object.fromEntries(
+              customTool.params.map(p => [p, { type: 'string', description: `Value for ${p}` }])
+            );
+          }
+          
+          tools.push(toolDef);
+          console.log(`[Custom Tool] Registered: ${customTool.name}`);
+        }
+      }
+    }
+
     // Tool execution function
     async function executeTool(toolName, toolInput) {
       const [owner, repoName] = site.github_repo.split('/');
@@ -1895,6 +1922,53 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         }
         
         return result;
+      }
+
+      // Check if this is a custom tool
+      if (site.config && site.config.custom_tools && Array.isArray(site.config.custom_tools)) {
+        const customTool = site.config.custom_tools.find(t => t.name === toolName);
+        if (customTool) {
+          try {
+            // Validate query is SELECT-only (security check)
+            const queryTrimmed = customTool.query.trim().toUpperCase();
+            if (!queryTrimmed.startsWith('SELECT')) {
+              return `Error: Custom tool queries must be SELECT statements only. Query starts with: ${customTool.query.trim().split(' ')[0]}`;
+            }
+            
+            // Check for dangerous SQL keywords
+            const dangerousKeywords = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE', 'TRUNCATE', 'EXEC'];
+            for (const keyword of dangerousKeywords) {
+              if (queryTrimmed.includes(keyword)) {
+                return `Error: Custom tool queries cannot contain ${keyword} statements.`;
+              }
+            }
+            
+            // Connect to custom DB if specified, otherwise use main site DB
+            const dbUrl = site.config.custom_db_url || process.env.DATABASE_URL;
+            const customPool = new pg.Pool({ connectionString: dbUrl });
+            
+            try {
+              // Build parameters array from toolInput
+              const params = (customTool.params || []).map(paramName => toolInput[paramName]);
+              
+              console.log(`[Custom Tool] Executing ${toolName}: ${customTool.query.slice(0, 100)}... with params:`, params);
+              
+              // Execute query
+              const result = await customPool.query(customTool.query, params);
+              
+              // Return results as JSON
+              return JSON.stringify({
+                rows: result.rows,
+                rowCount: result.rowCount
+              }, null, 2);
+            } finally {
+              await customPool.end();
+            }
+          } catch (error) {
+            console.error(`[Custom Tool] Error executing ${toolName}:`, error);
+            return `Error executing custom tool: ${error.message}`;
+          }
+        }
       }
 
       return `Unknown tool: ${toolName}`;
