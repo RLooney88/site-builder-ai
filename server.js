@@ -2129,6 +2129,22 @@ app.post('/sites/:siteId/sync-staging', async (req, res) => {
       );
     } catch (e) { /* table may not exist */ }
 
+    // Clear old chat session so AI starts fresh (no stale context)
+    try {
+      const oldSession = await pool.query(
+        'SELECT id FROM sessions WHERE site_id = $1 ORDER BY updated_at DESC LIMIT 1',
+        [siteId]
+      );
+      if (oldSession.rows.length > 0) {
+        const oldId = oldSession.rows[0].id;
+        await pool.query('DELETE FROM messages WHERE session_id = $1', [oldId]);
+        await pool.query('DELETE FROM sessions WHERE id = $1', [oldId]);
+        console.log(`[sync-staging] Cleared old session ${oldId}`);
+      }
+    } catch (e) {
+      console.log(`[sync-staging] Session cleanup skipped: ${e.message}`);
+    }
+
     console.log(`[sync-staging] Staging synced to main (${mainSha.slice(0, 7)}) for ${siteId}`);
     res.json({ synced: true, sha: mainSha, message: 'Staging branch synced to production' });
   } catch (error) {
