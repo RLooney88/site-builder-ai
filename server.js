@@ -970,6 +970,27 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       const token = site.github_token;
 
       if (toolName === 'read_file') {
+        // IMPORTANT: Check pending_edits FIRST so AI can see its own recent changes
+        try {
+          const pendingResult = await pool.query(
+            'SELECT content FROM pending_edits WHERE site_id = $1 AND file_path = $2 AND status = $3 ORDER BY created_at DESC LIMIT 1',
+            [req.params.siteId, toolInput.path, 'pending']
+          );
+          if (pendingResult.rows.length > 0) {
+            console.log(`[read_file] Reading from pending_edits: ${toolInput.path}`);
+            const content = pendingResult.rows[0].content;
+            if (content.length > 15000) {
+              const lines = content.split('\n');
+              const summary = `[File is ${content.length} chars, ${lines.length} lines (from pending edits) — showing first 300 lines. Use read_file_section to find specific content.]\n\n`;
+              return summary + lines.slice(0, 300).join('\n');
+            }
+            return content;
+          }
+        } catch (dbError) {
+          // Table might not exist yet (migration pending) — fall back to GitHub
+          console.log(`[read_file] pending_edits table not available, falling through: ${dbError.message}`);
+        }
+
         // Check if page exists in database (template system)
         try {
           const page = await getPageByPath(pool, req.params.siteId, toolInput.path);
@@ -983,7 +1004,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           console.log(`[read_file] Pages table not available, using GitHub: ${dbError.message}`);
         }
 
-        // Fall back to GitHub API if not in pages table
+        // Fall back to GitHub API if not in pages or pending_edits table
         const branch = toolInput.branch || 'staging';
         const resp = await fetch(
           `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=${branch}`,
@@ -1042,37 +1063,55 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         if (!toolInput.content) {
           return 'Error: No content provided for write_file.';
         }
-        // First check if file exists to get SHA
-        let sha = null;
-        const checkResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        if (checkResp.ok) {
-          const existing = await checkResp.json();
-          sha = existing.sha;
-        }
-
-        const body = {
-          message: toolInput.message || 'Update file via AI editor',
-          content: Buffer.from(toolInput.content, 'utf-8').toString('base64'),
-          branch: 'staging'
-        };
-        if (sha) body.sha = sha;
-
-        const writeResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
-          {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+        
+        // Save to pending_edits table instead of committing directly to GitHub
+        try {
+          await pool.query(
+            `INSERT INTO pending_edits (site_id, session_id, file_path, content, change_description, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')
+             ON CONFLICT (site_id, file_path, status) 
+             DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
+            [req.params.siteId, session.id, toolInput.path, toolInput.content, toolInput.message || 'Update file via AI editor']
+          );
+          
+          console.log(`[write_file] Saved to pending_edits: ${toolInput.path} (${toolInput.content.length} chars)`);
+          return `File saved to preview. Click "Preview Edits" to see changes on staging.`;
+        } catch (dbError) {
+          // If pending_edits table doesn't exist yet, fall back to direct GitHub commit
+          console.warn(`[write_file] pending_edits table not available, falling back to direct commit: ${dbError.message}`);
+          
+          // First check if file exists to get SHA
+          let sha = null;
+          const checkResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          if (checkResp.ok) {
+            const existing = await checkResp.json();
+            sha = existing.sha;
           }
-        );
-        if (!writeResp.ok) {
-          const err = await writeResp.json();
-          return `Error writing file: ${err.message}`;
+
+          const body = {
+            message: toolInput.message || 'Update file via AI editor',
+            content: Buffer.from(toolInput.content, 'utf-8').toString('base64'),
+            branch: 'staging'
+          };
+          if (sha) body.sha = sha;
+
+          const writeResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+            {
+              method: 'PUT',
+              headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            }
+          );
+          if (!writeResp.ok) {
+            const err = await writeResp.json();
+            return `Error writing file: ${err.message}`;
+          }
+          return `File ${toolInput.path} updated successfully on staging branch.`;
         }
-        return `File ${toolInput.path} updated successfully on staging branch.`;
       }
 
       if (toolName === 'update_page_content') {
@@ -1086,35 +1125,52 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           // Update content in database
           const fullPage = await updatePageContent(pool, page.id, toolInput.new_content);
 
-          // Get current file SHA from GitHub
-          const ghResp = await fetch(
-            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-          );
-          const ghSha = ghResp.ok ? (await ghResp.json()).sha : null;
+          // Save assembled page to pending_edits instead of GitHub
+          try {
+            await pool.query(
+              `INSERT INTO pending_edits (site_id, session_id, file_path, content, change_description, status)
+               VALUES ($1, $2, $3, $4, $5, 'pending')
+               ON CONFLICT (site_id, file_path, status) 
+               DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
+              [req.params.siteId, session.id, toolInput.path, fullPage, toolInput.message || 'Update page content via AI editor']
+            );
+            
+            console.log(`[update_page_content] Saved to pending_edits: ${toolInput.path}`);
+            return `Page updated successfully. Header, footer, and navigation preserved automatically. Click "Preview Edits" to see changes on staging.`;
+          } catch (dbError) {
+            // If pending_edits table doesn't exist, fall back to direct GitHub commit
+            console.warn(`[update_page_content] pending_edits not available, falling back to GitHub: ${dbError.message}`);
+            
+            // Get current file SHA from GitHub
+            const ghResp = await fetch(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+              { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+            );
+            const ghSha = ghResp.ok ? (await ghResp.json()).sha : null;
 
-          // Write assembled page to GitHub
-          const writeBody = {
-            message: toolInput.message || 'Update page content via AI editor',
-            content: Buffer.from(fullPage, 'utf-8').toString('base64'),
-            branch: 'staging'
-          };
-          if (ghSha) writeBody.sha = ghSha;
+            // Write assembled page to GitHub
+            const writeBody = {
+              message: toolInput.message || 'Update page content via AI editor',
+              content: Buffer.from(fullPage, 'utf-8').toString('base64'),
+              branch: 'staging'
+            };
+            if (ghSha) writeBody.sha = ghSha;
 
-          const writeResp = await fetch(
-            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
-            {
-              method: 'PUT',
-              headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-              body: JSON.stringify(writeBody)
+            const writeResp = await fetch(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+              {
+                method: 'PUT',
+                headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+                body: JSON.stringify(writeBody)
+              }
+            );
+            if (!writeResp.ok) {
+              const err = await writeResp.json();
+              return `Error writing to GitHub: ${err.message}`;
             }
-          );
-          if (!writeResp.ok) {
-            const err = await writeResp.json();
-            return `Error writing to GitHub: ${err.message}`;
-          }
 
-          return `Page updated successfully. Header, footer, and navigation preserved automatically.`;
+            return `Page updated successfully. Header, footer, and navigation preserved automatically.`;
+          }
         } catch (error) {
           console.error('[update_page_content] Error:', error);
           return `Error updating page: ${error.message}`;
@@ -1146,32 +1202,51 @@ app.post('/sites/:siteId/chat', async (req, res) => {
 
           console.log(`[update_template] Regenerating ${regenerated.length} pages`);
 
-          // Batch commit all regenerated pages to GitHub
-          for (const { path, html } of regenerated) {
-            // Get current file SHA
-            const ghResp = await fetch(
-              `https://api.github.com/repos/${owner}/${repoName}/contents/${path}?ref=staging`,
-              { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-            );
-            const ghSha = ghResp.ok ? (await ghResp.json()).sha : null;
+          // Save all regenerated pages to pending_edits instead of GitHub
+          try {
+            for (const { path, html } of regenerated) {
+              await pool.query(
+                `INSERT INTO pending_edits (site_id, session_id, file_path, content, change_description, status)
+                 VALUES ($1, $2, $3, $4, $5, 'pending')
+                 ON CONFLICT (site_id, file_path, status) 
+                 DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
+                [req.params.siteId, session.id, path, html, toolInput.message || `Update ${toolInput.template_type} template`]
+              );
+            }
+            
+            console.log(`[update_template] Saved ${regenerated.length} pages to pending_edits`);
+            return `${toolInput.template_type} template updated successfully. ${regenerated.length} pages regenerated and saved to preview. Click "Preview Edits" to see changes on staging.`;
+          } catch (dbError) {
+            // If pending_edits table doesn't exist, fall back to direct GitHub commit
+            console.warn(`[update_template] pending_edits not available, falling back to GitHub: ${dbError.message}`);
+            
+            // Batch commit all regenerated pages to GitHub
+            for (const { path, html } of regenerated) {
+              // Get current file SHA
+              const ghResp = await fetch(
+                `https://api.github.com/repos/${owner}/${repoName}/contents/${path}?ref=staging`,
+                { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+              );
+              const ghSha = ghResp.ok ? (await ghResp.json()).sha : null;
 
-            // Write updated page
-            await fetch(
-              `https://api.github.com/repos/${owner}/${repoName}/contents/${path}`,
-              {
-                method: 'PUT',
-                headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  message: toolInput.message || `Update ${toolInput.template_type} template`,
-                  content: Buffer.from(html, 'utf-8').toString('base64'),
-                  branch: 'staging',
-                  sha: ghSha
-                })
-              }
-            );
+              // Write updated page
+              await fetch(
+                `https://api.github.com/repos/${owner}/${repoName}/contents/${path}`,
+                {
+                  method: 'PUT',
+                  headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    message: toolInput.message || `Update ${toolInput.template_type} template`,
+                    content: Buffer.from(html, 'utf-8').toString('base64'),
+                    branch: 'staging',
+                    sha: ghSha
+                  })
+                }
+              );
+            }
+
+            return `${toolInput.template_type} template updated successfully. ${regenerated.length} pages regenerated and committed to staging. Changes will appear on all pages that use this template.`;
           }
-
-          return `${toolInput.template_type} template updated successfully. ${regenerated.length} pages regenerated and committed to staging. Changes will appear on all pages that use this template.`;
         } catch (error) {
           console.error('[update_template] Error:', error);
           return `Error updating template: ${error.message}`;
@@ -1281,45 +1356,63 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'revert_file') {
-        // Read the file from main (production) branch
-        const mainResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=main`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        if (!mainResp.ok) {
-          const err = await mainResp.json();
-          return `Error reading production version: ${err.message}`;
-        }
-        const mainData = await mainResp.json();
-
-        // Get current staging SHA for the file
-        const stagingResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        const stagingSha = stagingResp.ok ? (await stagingResp.json()).sha : null;
-
-        // Write the main version back to staging
-        const body = {
-          message: `Revert: ${toolInput.path} to production version`,
-          content: mainData.content.replace(/\n/g, ''), // GitHub returns base64 with newlines
-          branch: 'staging'
-        };
-        if (stagingSha) body.sha = stagingSha;
-
-        const writeResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
-          {
-            method: 'PUT',
-            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+        // Delete the pending edit for this file (if it exists)
+        try {
+          const deleteResult = await pool.query(
+            'DELETE FROM pending_edits WHERE site_id = $1 AND file_path = $2 AND status = $3',
+            [req.params.siteId, toolInput.path, 'pending']
+          );
+          
+          if (deleteResult.rowCount > 0) {
+            console.log(`[revert_file] Deleted pending edit for ${toolInput.path}`);
+            return `File reverted to production version. Pending changes discarded.`;
+          } else {
+            return `No pending changes found for ${toolInput.path}. File is already at production version.`;
           }
-        );
-        if (!writeResp.ok) {
-          const err = await writeResp.json();
-          return `Error reverting file: ${err.message}`;
+        } catch (dbError) {
+          // If pending_edits table doesn't exist, fall back to GitHub revert
+          console.warn(`[revert_file] pending_edits not available, falling back to GitHub revert: ${dbError.message}`);
+          
+          // Read the file from main (production) branch
+          const mainResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=main`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          if (!mainResp.ok) {
+            const err = await mainResp.json();
+            return `Error reading production version: ${err.message}`;
+          }
+          const mainData = await mainResp.json();
+
+          // Get current staging SHA for the file
+          const stagingResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          const stagingSha = stagingResp.ok ? (await stagingResp.json()).sha : null;
+
+          // Write the main version back to staging
+          const body = {
+            message: `Revert: ${toolInput.path} to production version`,
+            content: mainData.content.replace(/\n/g, ''), // GitHub returns base64 with newlines
+            branch: 'staging'
+          };
+          if (stagingSha) body.sha = stagingSha;
+
+          const writeResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+            {
+              method: 'PUT',
+              headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            }
+          );
+          if (!writeResp.ok) {
+            const err = await writeResp.json();
+            return `Error reverting file: ${err.message}`;
+          }
+          return `File ${toolInput.path} reverted to production version on staging branch.`;
         }
-        return `File ${toolInput.path} reverted to production version on staging branch.`;
       }
 
       if (toolName === 'list_files') {
@@ -1587,18 +1680,34 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'diff_preview') {
-        // Read from staging
-        const stagingResp = await fetch(
-          `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-          { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-        );
-        if (!stagingResp.ok) {
-          const err = await stagingResp.json();
-          return `Error reading staging version: ${err.message}`;
+        // Try to read from pending_edits first
+        let pendingContent = null;
+        try {
+          const pendingResult = await pool.query(
+            'SELECT content FROM pending_edits WHERE site_id = $1 AND file_path = $2 AND status = $3 ORDER BY created_at DESC LIMIT 1',
+            [req.params.siteId, toolInput.path, 'pending']
+          );
+          if (pendingResult.rows.length > 0) {
+            pendingContent = pendingResult.rows[0].content;
+          }
+        } catch (dbError) {
+          console.log(`[diff_preview] pending_edits table not available: ${dbError.message}`);
         }
-        const stagingData = await stagingResp.json();
-        if (!stagingData.content) return 'Staging content not available.';
-        const stagingContent = Buffer.from(stagingData.content, 'base64').toString('utf-8');
+        
+        // If no pending edit, read from staging
+        if (!pendingContent) {
+          const stagingResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          if (!stagingResp.ok) {
+            const err = await stagingResp.json();
+            return `Error reading staging version: ${err.message}`;
+          }
+          const stagingData = await stagingResp.json();
+          if (!stagingData.content) return 'Staging content not available.';
+          pendingContent = Buffer.from(stagingData.content, 'base64').toString('utf-8');
+        }
         
         // Read from main
         const mainResp = await fetch(
@@ -1613,28 +1722,28 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         const mainContent = Buffer.from(mainData.content, 'base64').toString('utf-8');
         
         // Simple line-by-line diff
-        const stagingLines = stagingContent.split('\n');
+        const pendingLines = pendingContent.split('\n');
         const mainLines = mainContent.split('\n');
         
         const diff = [];
-        const maxLen = Math.max(stagingLines.length, mainLines.length);
+        const maxLen = Math.max(pendingLines.length, mainLines.length);
         let changeCount = 0;
         const maxChanges = 50;
         
         for (let i = 0; i < maxLen && changeCount < maxChanges; i++) {
-          const stagingLine = stagingLines[i] || '';
+          const pendingLine = pendingLines[i] || '';
           const mainLine = mainLines[i] || '';
           
-          if (stagingLine !== mainLine) {
+          if (pendingLine !== mainLine) {
             changeCount++;
             if (mainLine) diff.push(`- ${mainLine}`);
-            if (stagingLine) diff.push(`+ ${stagingLine}`);
+            if (pendingLine) diff.push(`+ ${pendingLine}`);
             diff.push('');
           }
         }
         
         if (changeCount === 0) {
-          return 'No differences found between staging and production.';
+          return 'No differences found between pending changes and production.';
         }
         
         const summary = `${changeCount} changes${changeCount >= maxChanges ? ' (showing first 50)' : ''}:\n\n`;
@@ -1930,6 +2039,188 @@ app.get('/sites/:siteId/history', async (req, res) => {
   }
 });
 
+// GET /sites/:siteId/pending-edits - List all pending edits
+app.get('/sites/:siteId/pending-edits', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    
+    // Check if site exists
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Get all pending edits for this site
+    try {
+      const result = await pool.query(
+        'SELECT id, file_path, change_description, created_at FROM pending_edits WHERE site_id = $1 AND status = $2 ORDER BY created_at DESC',
+        [siteId, 'pending']
+      );
+      
+      res.json({
+        pending: result.rows,
+        count: result.rows.length
+      });
+    } catch (dbError) {
+      // Table doesn't exist yet
+      console.log(`[pending-edits] Table not available: ${dbError.message}`);
+      res.json({ pending: [], count: 0 });
+    }
+  } catch (error) {
+    console.error('Pending edits error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /sites/:siteId/push-to-staging - Batch commit all pending edits to GitHub staging branch
+app.post('/sites/:siteId/push-to-staging', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    
+    // Get site
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const site = siteResult.rows[0];
+    
+    // Get all pending edits for this site
+    let pendingEdits = [];
+    try {
+      const result = await pool.query(
+        'SELECT * FROM pending_edits WHERE site_id = $1 AND status = $2 ORDER BY created_at ASC',
+        [siteId, 'pending']
+      );
+      pendingEdits = result.rows;
+    } catch (dbError) {
+      // Table doesn't exist yet — nothing to push
+      console.log(`[push-to-staging] pending_edits table not available: ${dbError.message}`);
+      return res.json({ pushed: 0, message: 'No pending edits to push' });
+    }
+    
+    if (pendingEdits.length === 0) {
+      return res.json({ pushed: 0, message: 'No pending edits to push' });
+    }
+    
+    console.log(`[push-to-staging] Pushing ${pendingEdits.length} pending edits to GitHub staging`);
+    
+    // Batch commit all pending edits using GitHub Trees API
+    const [owner, repoName] = site.github_repo.split('/');
+    const token = site.github_token;
+    
+    // 1. Get current staging branch ref
+    const refResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/refs/heads/staging`,
+      { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    if (!refResp.ok) {
+      const refErr = await refResp.json();
+      return res.status(500).json({ error: `Failed to get staging ref: ${refErr.message}` });
+    }
+    const refData = await refResp.json();
+    const currentStagingSha = refData.object.sha;
+    
+    // 2. Get current commit to get tree SHA
+    const commitResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/commits/${currentStagingSha}`,
+      { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    if (!commitResp.ok) {
+      const commitErr = await commitResp.json();
+      return res.status(500).json({ error: `Failed to get commit: ${commitErr.message}` });
+    }
+    const commitData = await commitResp.json();
+    const baseTreeSha = commitData.tree.sha;
+    
+    // 3. Create new tree with all pending files
+    const tree = pendingEdits.map(edit => ({
+      path: edit.file_path,
+      mode: '100644',
+      type: 'blob',
+      content: edit.content
+    }));
+    
+    const treeResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/trees`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          base_tree: baseTreeSha,
+          tree
+        })
+      }
+    );
+    if (!treeResp.ok) {
+      const treeErr = await treeResp.json();
+      return res.status(500).json({ error: `Failed to create tree: ${treeErr.message}` });
+    }
+    const treeData = await treeResp.json();
+    const newTreeSha = treeData.sha;
+    
+    // 4. Create new commit
+    const commitMessage = `AI edits: ${pendingEdits.length} file${pendingEdits.length !== 1 ? 's' : ''} updated\n\n${pendingEdits.map(e => `- ${e.file_path}: ${e.change_description || 'Updated'}`).slice(0, 10).join('\n')}${pendingEdits.length > 10 ? `\n... and ${pendingEdits.length - 10} more` : ''}`;
+    
+    const newCommitResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/commits`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: commitMessage,
+          tree: newTreeSha,
+          parents: [currentStagingSha]
+        })
+      }
+    );
+    if (!newCommitResp.ok) {
+      const newCommitErr = await newCommitResp.json();
+      return res.status(500).json({ error: `Failed to create commit: ${newCommitErr.message}` });
+    }
+    const newCommitData = await newCommitResp.json();
+    const newCommitSha = newCommitData.sha;
+    
+    // 5. Update staging ref to point to new commit
+    const updateRefResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/refs/heads/staging`,
+      {
+        method: 'PATCH',
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sha: newCommitSha,
+          force: false
+        })
+      }
+    );
+    if (!updateRefResp.ok) {
+      const updateRefErr = await updateRefResp.json();
+      return res.status(500).json({ error: `Failed to update ref: ${updateRefErr.message}` });
+    }
+    
+    // 6. Mark all pending edits as pushed
+    await pool.query(
+      'UPDATE pending_edits SET status = $1, pushed_at = NOW() WHERE site_id = $2 AND status = $3',
+      ['pushed', siteId, 'pending']
+    );
+    
+    console.log(`[push-to-staging] Successfully pushed ${pendingEdits.length} edits to staging (commit ${newCommitSha.slice(0, 7)})`);
+    
+    // Generate preview URL
+    const vercelSlug = site.config?.vercelSlug || 'rcl-integrated';
+    const previewUrl = `https://${site.vercel_project}-git-staging-${vercelSlug}.vercel.app`;
+    
+    res.json({
+      pushed: pendingEdits.length,
+      commitSha: newCommitSha,
+      previewUrl,
+      message: `${pendingEdits.length} file${pendingEdits.length !== 1 ? 's' : ''} pushed to staging`
+    });
+  } catch (error) {
+    console.error('Push to staging error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /sites/:siteId/preview
 app.post('/sites/:siteId/preview', async (req, res) => {
   try {
@@ -1942,6 +2233,40 @@ app.post('/sites/:siteId/preview', async (req, res) => {
       return res.status(404).json({ error: 'Site not found' });
     }
     const site = siteResult.rows[0];
+    
+    // IMPORTANT: Push all pending edits to staging BEFORE starting Vercel polling
+    // This ensures the preview shows the latest AI changes
+    try {
+      const pendingResult = await pool.query(
+        'SELECT COUNT(*) as count FROM pending_edits WHERE site_id = $1 AND status = $2',
+        [siteId, 'pending']
+      );
+      const pendingCount = parseInt(pendingResult.rows[0]?.count || 0);
+      
+      if (pendingCount > 0) {
+        console.log(`[preview] Pushing ${pendingCount} pending edits before starting preview...`);
+        
+        // Call internal push-to-staging logic (or make internal request)
+        const pushResp = await fetch(`http://localhost:${PORT}/sites/${siteId}/push-to-staging`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        
+        if (!pushResp.ok) {
+          const pushErr = await pushResp.json();
+          console.error('[preview] Failed to push pending edits:', pushErr.error);
+          // Continue anyway — maybe there are already changes on staging
+        } else {
+          const pushData = await pushResp.json();
+          console.log(`[preview] Pushed ${pushData.pushed} edits to staging`);
+        }
+      } else {
+        console.log('[preview] No pending edits to push');
+      }
+    } catch (dbError) {
+      console.log(`[preview] Could not check pending edits: ${dbError.message}`);
+      // Continue anyway — table might not exist yet
+    }
     
     const session = await getSession(siteId);
     
