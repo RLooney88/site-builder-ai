@@ -11,6 +11,9 @@ import multer from 'multer';
 import dotenv from 'dotenv';
 import { generateJWT, getCMSBaseURL } from './lib/jwt.js';
 import { getStagingPreviewURL, publishToProduction, updateFile } from './lib/github.js';
+import { buildSystemPrompt } from './lib/prompts/context.js';
+import { assemblePage, regenerateAllPagesForTemplate, getPageByPath, updatePageContent } from './lib/page-assembler.js';
+import { extractAndStoreTemplates, extractHeader, extractFooter, extractMainContent } from './lib/template-extractor.js';
 
 // ============================================================
 // Storage Abstraction Layer (Swappable for Google Drive)
@@ -134,12 +137,12 @@ const app = express();
 app.use('/themis', express.static(join(__dirname, 'themis')));
 app.use((req, res, next) => {
   const host = req.hostname;
-  // app.buildwiththemis.com → Themis dashboard
-  if (host === 'app.buildwiththemis.com' && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
+  // app.themissites.com → Themis dashboard
+  if (host === 'app.themissites.com' && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
     return express.static(join(__dirname, 'themis'))(req, res, next);
   }
-  // buildwiththemis.com (root) → marketing site
-  if ((host === 'buildwiththemis.com' || host === 'www.buildwiththemis.com') && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
+  // themissites.com (root) → marketing site
+  if ((host === 'themissites.com' || host === 'www.themissites.com') && !req.path.startsWith('/sites') && !req.path.startsWith('/auth')) {
     return express.static(join(__dirname, 'marketing'))(req, res, next);
   }
   next();
@@ -508,6 +511,85 @@ app.post('/sites/:siteId/cache-layout', async (req, res) => {
   }
 });
 
+// POST /sites/:siteId/onboard — Extract templates and index pages for template system
+app.post('/sites/:siteId/onboard', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    
+    // Get site
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const site = siteResult.rows[0];
+    
+    if (!site.github_repo || !site.github_token) {
+      return res.status(400).json({ error: 'Site does not have GitHub configured' });
+    }
+    
+    console.log(`[Onboard] Starting template extraction for site: ${siteId} (${site.domain})`);
+    
+    const [owner, repoName] = site.github_repo.split('/');
+    const token = site.github_token;
+    
+    // Fetch all HTML files from dist/ directory
+    const htmlFiles = [];
+    
+    async function fetchHtmlFiles(path = 'dist') {
+      const resp = await fetch(
+        `https://api.github.com/repos/${owner}/${repoName}/contents/${path}?ref=main`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+      );
+      
+      if (!resp.ok) {
+        console.warn(`[Onboard] Could not fetch ${path}`);
+        return;
+      }
+      
+      const items = await resp.json();
+      
+      for (const item of items) {
+        if (item.type === 'file' && item.name.endsWith('.html')) {
+          // Fetch file content
+          const fileResp = await fetch(item.download_url);
+          const content = await fileResp.text();
+          htmlFiles.push({ path: item.path, content });
+          console.log(`[Onboard] Fetched: ${item.path} (${(item.size / 1024).toFixed(1)} KB)`);
+        } else if (item.type === 'dir' && !['css', 'js', 'images', 'uploads', 'fonts'].includes(item.name)) {
+          // Recurse into subdirectories (skip asset folders)
+          await fetchHtmlFiles(item.path);
+        }
+      }
+    }
+    
+    await fetchHtmlFiles();
+    
+    if (htmlFiles.length === 0) {
+      return res.status(400).json({ error: 'No HTML files found in repository' });
+    }
+    
+    console.log(`[Onboard] Found ${htmlFiles.length} HTML files. Extracting templates...`);
+    
+    // Extract and store templates
+    const result = await extractAndStoreTemplates(pool, siteId, htmlFiles);
+    
+    console.log(`[Onboard] Template extraction complete for ${siteId}:`, result);
+    
+    res.json({
+      success: true,
+      headerTemplateId: result.headerTemplateId,
+      footerTemplateId: result.footerTemplateId,
+      pageTemplateId: result.pageTemplateId,
+      pagesIndexed: result.pagesIndexed,
+      message: `Template system initialized. ${result.pagesIndexed} pages indexed and ready for editing.`
+    });
+    
+  } catch (error) {
+    console.error('[Onboard] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Helper: extract header and footer from full HTML page
 function extractHeaderFooter(content) {
   let headerEnd = -1;
@@ -607,211 +689,8 @@ async function saveMessage(sessionId, role, content) {
   );
 }
 
-// Build system prompt
-function buildSystemPrompt(site, cmsApiUrl, jwtToken) {
-  const basePrompt = site.config?.systemPrompt || '';
-  const brandGuide = site.brand_guide || {};
-  
-  // Format brand guide for system prompt
-  let brandSection = '';
-  if (brandGuide && Object.keys(brandGuide).length > 0) {
-    brandSection = `
-
-## BRAND GUIDE (ALWAYS FOLLOW THESE GUIDELINES)
-
-This site's brand guide is cached in the database. Use these values for ALL design decisions:
-
-**Colors:**
-${brandGuide.colors ? `
-- Primary: ${brandGuide.colors.primary || 'Not set'}
-- Secondary: ${brandGuide.colors.secondary || 'Not set'}
-- Accent: ${brandGuide.colors.accent || 'Not set'}
-- Text: ${brandGuide.colors.text || 'Not set'}
-- Background: ${brandGuide.colors.background || 'Not set'}` : 'Not configured'}
-
-**Typography:**
-${brandGuide.fonts ? `
-- Headings: ${brandGuide.fonts.heading || 'Not set'}
-- Body: ${brandGuide.fonts.body || 'Not set'}` : 'Not configured'}
-
-**Button Style:** ${brandGuide.button_style || 'Not documented'}
-
-**Layout Notes:** ${brandGuide.layout_notes || 'Not documented'}
-
-**Valid Pages (for link verification):**
-${brandGuide.valid_pages && brandGuide.valid_pages.length > 0 ? brandGuide.valid_pages.join(', ') : 'Use verify_links tool to check'}
-
-**IMPORTANT:** When creating or editing content, ALWAYS use these brand colors, fonts, and styling patterns. Never invent new colors or styles.
-`;
-  }
-  
-  return `You are the Site Editor AI for ${site.domain}.
-
-${basePrompt}
-${brandSection}
-
-${basePrompt}
-
-## ABOUT THIS SITE
-
-This is a STATIC site built from exported WordPress/Elementor pages. There is NO live WordPress backend.
-The files in \`dist/\` are the final HTML files served by Vercel. They are large (often 100KB+) because they include
-inline Elementor CSS and markup. This is normal.
-
-**HOW TO EDIT THESE FILES:**
-- You do NOT need to preserve the Elementor markup. You CAN and SHOULD replace page content wholesale.
-- When editing a page, read the first 300 lines to understand the structure (head, CSS links, header/nav).
-- Keep the existing \`<head>\`, navigation/header, and footer intact.
-- Replace the MAIN CONTENT AREA (the \`<main>\` or main \`<div>\` section) with clean, modern HTML.
-- Use the site's existing CSS classes where possible, or add inline Tailwind-style classes.
-- The result should be a clean, well-structured HTML page that matches the site's look and feel.
-- Do NOT refuse to edit because files are large or complex. Just replace the content section.
-- Do NOT suggest editing in WordPress — there is no WordPress. You are the editor.
-- NEVER give up or present "options" — just make the edit.
-
-**EDITING STRATEGY FOR LARGE FILES:**
-Use the \`replace_page_content\` tool — it's the fastest and most efficient way. You provide ONLY the new HTML content for the main area, and the tool automatically preserves the header/nav/CSS and footer. You don't need to read the whole file first.
-
-For small files (<15KB), you can use \`read_file\` + \`write_file\` directly.
-
-**PREFERRED workflow for page edits:**
-1. Use \`replace_page_content\` with the new content HTML — done in ONE tool call
-2. Only use read_file/write_file if you need fine-grained control over the entire file
-
-## BRANDING & STYLE GUIDELINES
-
-When creating or editing page content, ALWAYS match the existing site design:
-- **Before editing**, use \`read_file_section\` on another page (like dist/index.html) to see the CSS classes and styling patterns used
-- Copy the same class names, color patterns, and layout structure
-- The site uses custom CSS from Elementor — use the existing class patterns, not generic Tailwind
-- Common patterns: \`elementor-widget-wrap\`, \`elementor-element\`, etc.
-- If unsure about styling, read the site's main CSS file (dist/css/elementor.css) for reference
-- **Colors, fonts, and spacing should match the rest of the site exactly**
-
-**LINK VALIDATION (CRITICAL):**
-- Before creating ANY link to another page on the site, use the \`verify_links\` tool to confirm the page exists
-- Common pages: /petition/, /sign-the-petition/, /contact-us/, /be-an-election-judge/, /citizen-action/
-- NEVER guess at URLs — verify first
-
-## YOUR COMMUNICATION STYLE
-
-You are talking to a non-technical website owner. NEVER use developer jargon.
-- Do NOT mention branches, repos, GitHub, staging, APIs, commits, or merges.
-- Do NOT ask permission to make changes — just make them.
-- Do NOT explain the technical process — just describe what changed in plain English.
-- After making changes, say something like: "Done! Click 'Preview Edits' to see the changes."
-- Keep responses short and friendly. One or two sentences about what changed, then tell them to preview.
-
-**Example good response:**
-"I've updated the Citizen Action page — removed the event content and added a petition section with a 'Sign the Petition Now' button that links to your petition page. Click 'Preview Edits' to take a look!"
-
-**Example bad response:**
-"✅ Changes made to src/citizen-action.njk via GitHub API. Preview branch preview-2024-12-14 created. Once Vercel deploys, review at..."
-
-## DUAL EDITING SYSTEM (INTERNAL — do not explain this to the user)
-
-This site has TWO ways to edit content - you MUST use the correct one:
-
-### CMS-MANAGED CONTENT (Use API - NEVER edit files directly)
-
-**Blog Posts:**
-- List: GET ${cmsApiUrl}/api/admin/posts
-- View: GET ${cmsApiUrl}/api/admin/post?id={id}
-- Create: POST ${cmsApiUrl}/api/admin/posts
-  Body: { title, content, category, featuredImage, seoTitle, seoDescription }
-- Update: PUT ${cmsApiUrl}/api/admin/post?id={id}
-- Publish: POST ${cmsApiUrl}/api/admin/post-publish?id={id}
-- Preview: POST ${cmsApiUrl}/api/admin/post-preview?id={id}
-
-**Banner (Scrolling marquee):**
-- Get: GET ${cmsApiUrl}/api/admin/banner-settings
-- Update: PUT ${cmsApiUrl}/api/admin/banner-settings
-  Body: { text, link, enabled }
-  (Auto-deploys to GitHub on save)
-
-**Petitions:**
-- List: GET ${cmsApiUrl}/api/admin/petitions
-- Create: POST ${cmsApiUrl}/api/admin/petitions
-- Update: PUT ${cmsApiUrl}/api/admin/petitions?id={id}
-- Delete: DELETE ${cmsApiUrl}/api/admin/petitions?id={id}
-
-**Authentication:**
-All CMS API calls require JWT token in Authorization header:
-Authorization: Bearer ${jwtToken}
-
-**CRITICAL:** When user asks to edit blog posts, banner, or petitions:
-1. Use the CMS APIs above
-2. DO NOT edit HTML files directly
-3. The CMS generates HTML automatically
-
-### STATIC CONTENT (Edit files via GitHub API)
-
-**GitHub Repository:** ${site.github_repo}
-**Branch:** Always use the \`staging\` branch (never main, never create temporary branches)
-**Tools:** Use the read_file, write_file, and list_files tools to make changes. Do NOT write fetch() calls or code — use the tools directly.
-
-**Built site files (what Vercel serves):**
-- **Pages:** dist/*.html, dist/*/index.html
-- **Styles:** dist/css/*.css
-- **Scripts:** dist/js/*.js
-- **Images:** dist/images/
-
-**Source files (Eleventy templates — only if the site uses a build step):**
-- **Pages:** src/*.njk, src/pages/*.njk
-- **Templates:** src/_includes/*.njk
-- **Styles:** src/css/*.css
-
-**IMPORTANT:** This site deploys from the \`dist/\` folder. Edit \`dist/\` files directly for immediate effect.
-
-**For static content edits, use the provided tools:**
-1. Use \`list_files\` to see what files exist in a directory
-2. Use \`read_file\` to get the current content of a file (auto-truncates large files)
-3. Use \`read_file_section\` to search for and read a specific part of a large file (more efficient)
-4. Use \`write_file\` to update the file on the staging branch
-5. Use \`revert_file\` if you need to undo changes
-6. The user will preview via their staging URL and publish when ready
-
-**TOKEN EFFICIENCY RULES:**
-- For large HTML files (>15KB), use \`read_file_section\` with a search term instead of \`read_file\`
-- When rewriting a page, you MUST include the COMPLETE file content in write_file — not just the changed section
-- Don't read files you don't need to edit
-- One list_files call is usually enough — don't browse multiple directories unless necessary
-
-**ALWAYS use the tools to make actual edits. NEVER just describe what you would do — actually do it using the tools.**
-
-## ROUTING DECISION TREE
-
-User request → Analyze → Choose route:
-
-"Add/edit blog post" → CMS API (POST /api/admin/posts)
-"Update banner" → CMS API (PUT /api/admin/banner-settings)
-"Edit petition" → CMS API
-"Change homepage" → GitHub file edit (dist/index.html)
-"Update navigation" → GitHub file edit (dist/ - find header in HTML files)
-"Change CSS" → GitHub file edit (dist/css/*.css)
-"Add new page" → GitHub file edit (create new dist/page/index.html)
-
-## RESPONSE FORMAT
-
-## RESPONSE FORMAT
-
-After making changes, respond in PLAIN ENGLISH:
-1. Briefly describe what you changed (1-2 sentences, no technical details)
-2. End with: "Click 'Preview Edits' to see the changes!"
-3. Do NOT list files, branches, APIs, or technical details
-4. Do NOT ask "would you like me to proceed?" — just do it
-5. Do NOT use developer emoji patterns (✅ 📍 🔗 ⏭️)
-
-**CRITICAL INTERNAL RULES (never mention these to the user):**
-- NEVER create temporary preview branches. Always push to \`staging\`.
-- NEVER write fetch() or JavaScript code. Use the provided tools (read_file, write_file, list_files) to make all changes.
-- When reading files from GitHub, always use \`?ref=staging\` to get the staging version.
-- When writing files, always specify \`branch: "staging"\` in the API call.
-- NEVER ask the user about branches, merging, or deployment. That's handled by the Preview/Publish buttons.
-- Just make the change and tell them to preview. That's it.
-
-Be friendly, concise, and non-technical.`;
-}
+// System prompt now built by lib/prompts/context.js (modular, token-efficient)
+// See buildSystemPrompt(site, pool, tools) for the new implementation
 
 // POST /sites/:siteId/chat
 app.post('/sites/:siteId/chat', async (req, res) => {
@@ -891,6 +770,32 @@ app.post('/sites/:siteId/chat', async (req, res) => {
             message: { type: 'string', description: 'Commit message describing the change' }
           },
           required: ['path', 'content', 'message']
+        }
+      },
+      {
+        name: 'update_page_content',
+        description: 'Update the main content section of a page. Headers, footers, and navigation are preserved automatically from templates. This is the preferred method for editing pages.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Page path (e.g., dist/index.html)' },
+            new_content: { type: 'string', description: 'New HTML content for the main section ONLY. Do not include headers, footers, or full page structure — just the main content area.' },
+            message: { type: 'string', description: 'Commit message' }
+          },
+          required: ['path', 'new_content', 'message']
+        }
+      },
+      {
+        name: 'update_template',
+        description: 'Edit a header, footer, or navigation template. Changes apply to ALL pages that use this template. Use with care — this affects the entire site.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            template_type: { type: 'string', enum: ['header', 'footer', 'navigation'], description: 'Which template to edit' },
+            new_content: { type: 'string', description: 'New HTML for the template' },
+            message: { type: 'string', description: 'Commit message explaining the change' }
+          },
+          required: ['template_type', 'new_content', 'message']
         }
       },
       {
@@ -1065,6 +970,20 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       const token = site.github_token;
 
       if (toolName === 'read_file') {
+        // Check if page exists in database (template system)
+        try {
+          const page = await getPageByPath(pool, req.params.siteId, toolInput.path);
+          if (page) {
+            // Page is managed by template system — return just content section
+            console.log(`[read_file] Reading from pages table: ${toolInput.path}`);
+            return page.content;
+          }
+        } catch (dbError) {
+          // Pages table might not exist yet (migration pending) — fall back to GitHub
+          console.log(`[read_file] Pages table not available, using GitHub: ${dbError.message}`);
+        }
+
+        // Fall back to GitHub API if not in pages table
         const branch = toolInput.branch || 'staging';
         const resp = await fetch(
           `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=${branch}`,
@@ -1154,6 +1073,109 @@ app.post('/sites/:siteId/chat', async (req, res) => {
           return `Error writing file: ${err.message}`;
         }
         return `File ${toolInput.path} updated successfully on staging branch.`;
+      }
+
+      if (toolName === 'update_page_content') {
+        try {
+          // Get page from database
+          const page = await getPageByPath(pool, req.params.siteId, toolInput.path);
+          if (!page) {
+            return `Error: Page not found at ${toolInput.path}. This page may not have been indexed in the template system yet. Use write_file as a fallback or run the onboard endpoint to index the site.`;
+          }
+
+          // Update content in database
+          const fullPage = await updatePageContent(pool, page.id, toolInput.new_content);
+
+          // Get current file SHA from GitHub
+          const ghResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
+            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+          const ghSha = ghResp.ok ? (await ghResp.json()).sha : null;
+
+          // Write assembled page to GitHub
+          const writeBody = {
+            message: toolInput.message || 'Update page content via AI editor',
+            content: Buffer.from(fullPage, 'utf-8').toString('base64'),
+            branch: 'staging'
+          };
+          if (ghSha) writeBody.sha = ghSha;
+
+          const writeResp = await fetch(
+            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}`,
+            {
+              method: 'PUT',
+              headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+              body: JSON.stringify(writeBody)
+            }
+          );
+          if (!writeResp.ok) {
+            const err = await writeResp.json();
+            return `Error writing to GitHub: ${err.message}`;
+          }
+
+          return `Page updated successfully. Header, footer, and navigation preserved automatically.`;
+        } catch (error) {
+          console.error('[update_page_content] Error:', error);
+          return `Error updating page: ${error.message}`;
+        }
+      }
+
+      if (toolName === 'update_template') {
+        try {
+          // Get template from database
+          const templateResult = await pool.query(
+            'SELECT * FROM templates WHERE site_id = $1 AND type = $2',
+            [req.params.siteId, toolInput.template_type]
+          );
+          
+          if (templateResult.rows.length === 0) {
+            return `Error: No ${toolInput.template_type} template found for this site. The template system may not be set up yet. Run the onboard endpoint first.`;
+          }
+
+          const template = templateResult.rows[0];
+
+          // Update template in database
+          await pool.query(
+            'UPDATE templates SET content = $1, updated_at = NOW() WHERE id = $2',
+            [toolInput.new_content, template.id]
+          );
+
+          // Regenerate all pages that use this template
+          const regenerated = await regenerateAllPagesForTemplate(pool, template.id);
+
+          console.log(`[update_template] Regenerating ${regenerated.length} pages`);
+
+          // Batch commit all regenerated pages to GitHub
+          for (const { path, html } of regenerated) {
+            // Get current file SHA
+            const ghResp = await fetch(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${path}?ref=staging`,
+              { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+            );
+            const ghSha = ghResp.ok ? (await ghResp.json()).sha : null;
+
+            // Write updated page
+            await fetch(
+              `https://api.github.com/repos/${owner}/${repoName}/contents/${path}`,
+              {
+                method: 'PUT',
+                headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  message: toolInput.message || `Update ${toolInput.template_type} template`,
+                  content: Buffer.from(html, 'utf-8').toString('base64'),
+                  branch: 'staging',
+                  sha: ghSha
+                })
+              }
+            );
+          }
+
+          return `${toolInput.template_type} template updated successfully. ${regenerated.length} pages regenerated and committed to staging. Changes will appear on all pages that use this template.`;
+        } catch (error) {
+          console.error('[update_template] Error:', error);
+          return `Error updating template: ${error.message}`;
+        }
       }
 
       if (toolName === 'replace_page_content') {
@@ -1802,7 +1824,7 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-5',
         max_tokens: 16384,
-        system: [{ type: 'text', text: buildSystemPrompt(site, cmsApiUrl, jwtToken), cache_control: { type: 'ephemeral' } }],
+        system: [{ type: 'text', text: await buildSystemPrompt(site, pool, tools), cache_control: { type: 'ephemeral' } }],
         tools,
         messages: currentMessages
       });
