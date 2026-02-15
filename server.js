@@ -2088,6 +2088,55 @@ app.get('/sites/:siteId/pending-edits', async (req, res) => {
   }
 });
 
+// POST /sites/:siteId/sync-staging - Reset staging branch to match main (production)
+app.post('/sites/:siteId/sync-staging', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) return res.status(404).json({ error: 'Site not found' });
+    const site = siteResult.rows[0];
+    const [owner, repoName] = site.github_repo.split('/');
+    const token = site.github_token;
+
+    // Get main branch SHA
+    const mainRef = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/refs/heads/main`,
+      { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    if (!mainRef.ok) return res.status(500).json({ error: 'Failed to get main branch ref' });
+    const mainData = await mainRef.json();
+    const mainSha = mainData.object.sha;
+
+    // Force-update staging to point to same commit as main
+    const updateRef = await fetch(
+      `https://api.github.com/repos/${owner}/${repoName}/git/refs/heads/staging`,
+      {
+        method: 'PATCH',
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sha: mainSha, force: true })
+      }
+    );
+    if (!updateRef.ok) {
+      const err = await updateRef.json();
+      return res.status(500).json({ error: `Failed to sync staging: ${err.message}` });
+    }
+
+    // Discard any existing pending edits (they were from a stale session)
+    try {
+      await pool.query(
+        "UPDATE pending_edits SET status = 'discarded' WHERE site_id = $1 AND status = 'pending'",
+        [siteId]
+      );
+    } catch (e) { /* table may not exist */ }
+
+    console.log(`[sync-staging] Staging synced to main (${mainSha.slice(0, 7)}) for ${siteId}`);
+    res.json({ synced: true, sha: mainSha, message: 'Staging branch synced to production' });
+  } catch (error) {
+    console.error('Sync staging error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /sites/:siteId/push-to-staging - Batch commit all pending edits to GitHub staging branch
 app.post('/sites/:siteId/push-to-staging', async (req, res) => {
   try {
