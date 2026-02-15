@@ -6,10 +6,11 @@ import Anthropic from '@anthropic-ai/sdk';
 import simpleGit from 'simple-git';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import crypto from 'crypto';
 import fs from 'fs/promises';
 import multer from 'multer';
 import dotenv from 'dotenv';
-import { generateJWT, getCMSBaseURL } from './lib/jwt.js';
+import { generateJWT, getCMSBaseURL, generateAdminJWT, verifyJWT } from './lib/jwt.js';
 import { getStagingPreviewURL, publishToProduction, updateFile } from './lib/github.js';
 import { buildSystemPrompt } from './lib/prompts/context.js';
 import { assemblePage, regenerateAllPagesForTemplate, getPageByPath, updatePageContent } from './lib/page-assembler.js';
@@ -2278,9 +2279,14 @@ app.post('/sites/:siteId/push-to-staging', async (req, res) => {
       return res.status(500).json({ error: `Failed to update ref: ${updateRefErr.message}` });
     }
     
-    // 6. Mark all pending edits as pushed
+    // 6. Delete old pushed records for the same files, then mark pending as pushed
+    const pendingFilePaths = pendingEdits.map(e => e.file_path);
     await pool.query(
-      'UPDATE pending_edits SET status = $1, pushed_at = NOW() WHERE site_id = $2 AND status = $3',
+      'DELETE FROM pending_edits WHERE site_id = $1 AND status = $2 AND file_path = ANY($3)',
+      [siteId, 'pushed', pendingFilePaths]
+    );
+    await pool.query(
+      'UPDATE pending_edits SET status = $1, updated_at = NOW() WHERE site_id = $2 AND status = $3',
       ['pushed', siteId, 'pending']
     );
     
@@ -2688,6 +2694,192 @@ app.get('/sites/:siteId/uploads', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================================
+// Admin Email-Verified Login Flow
+// ============================================================
+
+/**
+ * Send verification email via SendGrid or log to console
+ * @param {string} email - Recipient email address
+ * @string} verificationLink - Magic link with token
+ * @param {string} siteId - Site identifier
+ */
+async function sendVerificationEmail(email, verificationLink, siteId) {
+  const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+  
+  if (!SENDGRID_API_KEY) {
+    console.log('????????????????????????????????????????');
+    console.log('??  SENDGRID_API_KEY not configured');
+    console.log('?? Email verification link for:', email);
+    console.log('?? Link:', verificationLink);
+    console.log('????????????????????????????????????????');
+    return { success: true, method: 'console' };
+  }
+  
+  try {
+    // Send email via SendGrid
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer `,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        personalizations: [{
+          to: [{ email }],
+          subject: 'Admin Login Verification'
+        }],
+        from: {
+          email: process.env.SENDGRID_FROM_EMAIL || 'noreply@themissites.com',
+          name: 'Themis Sites'
+        },
+        content: [{
+          type: 'text/html',
+          value: `
+            <h2>Admin Login Verification</h2>
+            <p>Click the link below to complete your login:</p>
+            <p><a href="" style="background-color: #4CAF50; color: white; padding: 14px 20px; text-decoration: none; display: inline-block; border-radius: 4px;">Verify & Login</a></p>
+            <p>Or copy this link:</p>
+            <p><code></code></p>
+            <p><strong>This link expires in 10 minutes.</strong></p>
+            <p>If you didn't request this login, you can safely ignore this email.</p>
+          `
+        }]
+      })
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('SendGrid error:', errorText);
+      throw new Error(`SendGrid API error: `);
+    }
+    
+    console.log(`??  Verification email sent to  via SendGrid`);
+    return { success: true, method: 'sendgrid' };
+    
+  } catch (error) {
+    console.error('Failed to send email via SendGrid:', error.message);
+    console.log('????????????????????????????????????????');
+    console.log('??  SendGrid failed, falling back to console');
+    console.log('?? Email verification link for:', email);
+    console.log('?? Link:', verificationLink);
+    console.log('????????????????????????????????????????');
+    return { success: true, method: 'console-fallback' };
+  }
+}
+
+// POST /sites/:siteId/admin/login
+// Step 1: Validate credentials, generate temp token, send verification email
+app.post('/sites/:siteId/admin/login', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    
+    // Get site
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = 1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const site = siteResult.rows[0];
+    
+    // Validate credentials
+    // TODO: Replace this with actual credential validation from database
+    // For now, using environment variable for admin credentials
+    const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@themissites.com';
+    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+    
+    if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+      // Add a small delay to prevent timing attacks
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Generate temporary verification token (random 32 bytes)
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes from now
+    
+    // Store token in database
+    await pool.query(
+      'INSERT INTO admin_auth_tokens (email, token, expires_at) VALUES (1, 2, 3)',
+      [email, token, expiresAt]
+    );
+    
+    // Build verification link
+    const baseUrl = process.env.BASE_URL || `http://localhost:`;
+    const verificationLink = `/sites//admin/verify?token=`;
+    
+    // Send verification email
+    const emailResult = await sendVerificationEmail(email, verificationLink, siteId);
+    
+    console.log(`?? Admin login initiated for  on site  (token expires in 10 min)`);
+    
+    res.json({
+      success: true,
+      message: 'Check your email for a verification link',
+      emailMethod: emailResult.method,
+      expiresIn: 600 // seconds
+    });
+    
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /sites/:siteId/admin/verify
+// Step 2: Validate temp token, return 24h JWT
+app.get('/sites/:siteId/admin/verify', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    const { token } = req.query;
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Verification token is required' });
+    }
+    
+    // Look up token in database
+    const tokenResult = await pool.query(
+      'SELECT * FROM admin_auth_tokens WHERE token = 1 AND NOT used AND expires_at > NOW()',
+      [token]
+    );
+    
+    if (tokenResult.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid or expired verification token' });
+    }
+    
+    const authToken = tokenResult.rows[0];
+    
+    // Mark token as used
+    await pool.query(
+      'UPDATE admin_auth_tokens SET used = TRUE WHERE id = 1',
+      [authToken.id]
+    );
+    
+    // Generate 24-hour JWT
+    const jwt = generateAdminJWT(authToken.email);
+    
+    console.log(`? Admin login verified for  on site  (JWT valid for 24h)`);
+    
+    // Return JWT in response
+    // The frontend can store this in localStorage and use for authenticated requests
+    res.json({
+      success: true,
+      token: jwt,
+      email: authToken.email,
+      expiresIn: 86400 // 24 hours in seconds
+    });
+    
+  } catch (error) {
+    console.error('Admin verify error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 
 // Start server
 app.listen(PORT, () => {
