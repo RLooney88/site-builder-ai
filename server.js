@@ -127,6 +127,59 @@ async function listSiteFiles(site, siteId) {
 // End Storage Abstraction Layer
 // ============================================================
 
+// ============================================================
+// Template Rendering System
+// ============================================================
+
+/**
+ * Render a content template with data and brand variables
+ * @param {string} templateHtml - Template HTML with {{variable}} placeholders
+ * @param {Object} data - Data object with variable values
+ * @param {Object} brandGuide - Brand guide from site.brand_guide
+ * @returns {string} - Rendered HTML
+ */
+function renderTemplate(templateHtml, data, brandGuide = {}) {
+  let rendered = templateHtml;
+  
+  // First, replace brand variables ({{brand.colors.primary}}, etc.)
+  if (brandGuide.colors) {
+    for (const [colorName, colorValue] of Object.entries(brandGuide.colors)) {
+      const placeholder = new RegExp(`\\{\\{brand\\.colors\\.${colorName}\\}\\}`, 'g');
+      rendered = rendered.replace(placeholder, colorValue);
+    }
+  }
+  
+  if (brandGuide.fonts) {
+    for (const [fontName, fontValue] of Object.entries(brandGuide.fonts)) {
+      const placeholder = new RegExp(`\\{\\{brand\\.fonts\\.${fontName}\\}\\}`, 'g');
+      rendered = rendered.replace(placeholder, fontValue);
+    }
+  }
+  
+  if (brandGuide.button_style) {
+    rendered = rendered.replace(/\{\{brand\.button_style\}\}/g, brandGuide.button_style);
+  }
+  
+  // Next, replace data variables ({{title}}, {{description}}, etc.)
+  for (const [key, value] of Object.entries(data)) {
+    const placeholder = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
+    rendered = rendered.replace(placeholder, String(value));
+  }
+  
+  // Handle conditional sections ({{#key}}...{{/key}})
+  // Simple implementation: remove section if key is falsy, keep content if truthy
+  const conditionalPattern = /\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g;
+  rendered = rendered.replace(conditionalPattern, (match, key, content) => {
+    return data[key] ? content : '';
+  });
+  
+  return rendered;
+}
+
+// ============================================================
+// End Template Rendering System
+// ============================================================
+
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -961,6 +1014,72 @@ app.post('/sites/:siteId/chat', async (req, res) => {
             quality: { type: 'number', description: 'Quality setting for JPEG (default: 85)' }
           },
           required: ['path']
+        }
+      },
+      {
+        name: 'list_content_templates',
+        description: 'List all content templates available for this site. Content templates define how structured data (petitions, posts, events) renders on pages. Use this to see what templates exist before placing content.',
+        input_schema: {
+          type: 'object',
+          properties: {},
+          required: []
+        }
+      },
+      {
+        name: 'get_content_template',
+        description: 'Get the full HTML of a specific content template by name. Use this to see the template structure and available variables.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Template name (e.g., "petition_card", "post_full")' }
+          },
+          required: ['name']
+        }
+      },
+      {
+        name: 'create_content_template',
+        description: 'Create a new content template. Use this when a user requests a content type that doesn\'t have a template yet. Always use brand variables ({{brand.colors.primary}}, {{brand.fonts.heading}}, etc.) for consistent styling.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Template identifier (e.g., "event_card", "volunteer_signup")' },
+            description: { type: 'string', description: 'When to use this template (helps AI choose the right template)' },
+            html: { type: 'string', description: 'Template HTML with {{variable}} placeholders and {{brand.colors.primary}} etc. for brand integration' },
+            modes: { 
+              type: 'array', 
+              items: { type: 'string' },
+              description: 'Array of contexts where this applies (e.g., ["card", "full", "banner"])' 
+            }
+          },
+          required: ['name', 'description', 'html', 'modes']
+        }
+      },
+      {
+        name: 'update_content_template',
+        description: 'Update an existing content template\'s HTML. Use this when users want to change the look/feel of a template.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Template name to update' },
+            html: { type: 'string', description: 'New template HTML' },
+            description: { type: 'string', description: 'Updated description (optional)' }
+          },
+          required: ['name', 'html']
+        }
+      },
+      {
+        name: 'render_content',
+        description: 'Render a content template with data. Takes a template name and data object, returns the rendered HTML with all variables filled in (including brand variables). This is what you use to generate actual page content.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            template_name: { type: 'string', description: 'Name of the template to render' },
+            data: { 
+              type: 'object', 
+              description: 'JSON object with variable values (e.g., {"title": "...", "description": "...", "url": "..."})'
+            }
+          },
+          required: ['template_name', 'data']
         }
       }
     ];
@@ -1922,6 +2041,109 @@ app.post('/sites/:siteId/chat', async (req, res) => {
         }
         
         return result;
+      }
+
+      // Content Template Tools
+      if (toolName === 'list_content_templates') {
+        const config = site.config || {};
+        const templates = config.content_templates || [];
+        
+        if (templates.length === 0) {
+          return 'No content templates configured for this site yet. Use create_content_template to add templates for structured content like petitions, posts, or events.';
+        }
+        
+        const templateList = templates.map(t => {
+          return `**${t.name}**\n  Description: ${t.description}\n  Modes: ${t.modes.join(', ')}`;
+        }).join('\n\n');
+        
+        return `Available content templates (${templates.length}):\n\n${templateList}`;
+      }
+
+      if (toolName === 'get_content_template') {
+        const config = site.config || {};
+        const templates = config.content_templates || [];
+        const template = templates.find(t => t.name === toolInput.name);
+        
+        if (!template) {
+          return `Template "${toolInput.name}" not found. Use list_content_templates to see available templates.`;
+        }
+        
+        return `**Template: ${template.name}**\n\nDescription: ${template.description}\nModes: ${template.modes.join(', ')}\n\n**HTML:**\n\`\`\`html\n${template.html}\n\`\`\``;
+      }
+
+      if (toolName === 'create_content_template') {
+        // Get current config
+        const config = site.config || {};
+        const templates = config.content_templates || [];
+        
+        // Check if template with this name already exists
+        if (templates.find(t => t.name === toolInput.name)) {
+          return `Error: Template "${toolInput.name}" already exists. Use update_content_template to modify it.`;
+        }
+        
+        // Add new template
+        const newTemplate = {
+          name: toolInput.name,
+          description: toolInput.description,
+          html: toolInput.html,
+          modes: toolInput.modes
+        };
+        templates.push(newTemplate);
+        
+        // Update config in database
+        config.content_templates = templates;
+        await pool.query(
+          'UPDATE sites SET config = $1, updated_at = NOW() WHERE id = $2',
+          [JSON.stringify(config), req.params.siteId]
+        );
+        
+        console.log(`[create_content_template] Created template: ${toolInput.name}`);
+        return `Content template "${toolInput.name}" created successfully. Use render_content to generate HTML from this template.`;
+      }
+
+      if (toolName === 'update_content_template') {
+        // Get current config
+        const config = site.config || {};
+        const templates = config.content_templates || [];
+        
+        // Find template to update
+        const templateIndex = templates.findIndex(t => t.name === toolInput.name);
+        if (templateIndex === -1) {
+          return `Error: Template "${toolInput.name}" not found. Use create_content_template to create it first.`;
+        }
+        
+        // Update template
+        templates[templateIndex].html = toolInput.html;
+        if (toolInput.description) {
+          templates[templateIndex].description = toolInput.description;
+        }
+        
+        // Update config in database
+        config.content_templates = templates;
+        await pool.query(
+          'UPDATE sites SET config = $1, updated_at = NOW() WHERE id = $2',
+          [JSON.stringify(config), req.params.siteId]
+        );
+        
+        console.log(`[update_content_template] Updated template: ${toolInput.name}`);
+        return `Content template "${toolInput.name}" updated successfully.`;
+      }
+
+      if (toolName === 'render_content') {
+        // Get template from config
+        const config = site.config || {};
+        const templates = config.content_templates || [];
+        const template = templates.find(t => t.name === toolInput.template_name);
+        
+        if (!template) {
+          return `Error: Template "${toolInput.template_name}" not found. Use list_content_templates to see available templates.`;
+        }
+        
+        // Render template with data and brand guide
+        const rendered = renderTemplate(template.html, toolInput.data, site.brand_guide);
+        
+        console.log(`[render_content] Rendered template: ${toolInput.template_name} (${rendered.length} chars)`);
+        return rendered;
       }
 
       // Check if this is a custom tool
