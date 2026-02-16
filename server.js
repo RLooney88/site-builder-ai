@@ -290,6 +290,33 @@ app.get('/sites/:siteId', async (req, res) => {
   }
 });
 
+// GET /sites/:siteId/templates - Public endpoint for runtime template loading (no auth)
+// Returns cached_header, cached_footer, cached_css from DB
+// CORS enabled for all origins (loaded by browser on client sites)
+app.get('/sites/:siteId/templates', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Cache-Control', 'public, max-age=60'); // 60s cache so DB edits show within a minute
+    const result = await pool.query(
+      'SELECT cached_header, cached_footer, cached_css FROM sites WHERE id = $1',
+      [siteId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    const { cached_header, cached_footer, cached_css } = result.rows[0];
+    res.json({
+      header: cached_header || '',
+      footer: cached_footer || '',
+      css: cached_css || ''
+    });
+  } catch (error) {
+    console.error('Get templates error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /sites/:siteId/pages - List files in repo (for knowing what content exists)
 app.get('/sites/:siteId/pages', async (req, res) => {
   try {
@@ -1401,43 +1428,21 @@ app.post('/sites/:siteId/chat', async (req, res) => {
       }
 
       if (toolName === 'replace_page_content') {
-        // Check for cached header/footer first
-        const siteData = await pool.query('SELECT cached_header, cached_footer FROM sites WHERE id = $1', [req.params.siteId]);
-        const cachedHeader = siteData.rows[0]?.cached_header;
-        const cachedFooter = siteData.rows[0]?.cached_footer;
-        
-        let header, footer;
-        
-        if (cachedHeader && cachedFooter) {
-          console.log(`[Tool] Using cached header (${cachedHeader.length} chars) and footer (${cachedFooter.length} chars)`);
-          header = cachedHeader;
-          footer = cachedFooter;
-        } else {
-          // No cache — read current file and parse
-          const resp = await fetch(
-            `https://api.github.com/repos/${owner}/${repoName}/contents/${toolInput.path}?ref=staging`,
-            { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' } }
-          );
-          if (!resp.ok) {
-            const err = await resp.json();
-            return `Error reading file: ${err.message}`;
-          }
-          const data = await resp.json();
-          if (!data.content) return 'File content not available.';
-          const fullContent = Buffer.from(data.content, 'base64').toString('utf-8');
-          
-          const extracted = extractHeaderFooter(fullContent);
-          header = extracted.header;
-          footer = extracted.footer;
-          
-          await pool.query(
-            'UPDATE sites SET cached_header = $1, cached_footer = $2 WHERE id = $3',
-            [header, footer, req.params.siteId]
-          );
-          console.log(`[Tool] Auto-cached header/footer for ${req.params.siteId}`);
-        }
+        // NEW ARCHITECTURE: Pages use shared templates loaded at runtime.
+        // Header/footer are at dist/templates/header.html and dist/templates/footer.html.
+        // replace_page_content now only writes the <main> body content — no header/footer wrapping.
+        // If the user wants to edit the header/footer, they edit the template files directly.
 
-        const newPage = header + '\n' + toolInput.new_content + '\n' + footer;
+        // Check if this is a template file edit (header/footer/css)
+        const isTemplateFile = toolInput.path && (
+          toolInput.path.includes('templates/header.html') ||
+          toolInput.path.includes('templates/footer.html') ||
+          toolInput.path.includes('templates/template.css')
+        );
+
+        // For template files, write the full content as-is
+        // For regular pages, write just the body content (no header/footer wrapping)
+        const newPage = toolInput.new_content;
 
         // Save to pending_edits instead of GitHub
         try {
@@ -1448,8 +1453,9 @@ app.post('/sites/:siteId/chat', async (req, res) => {
              DO UPDATE SET content = $4, change_description = $5, created_at = NOW(), session_id = $2`,
             [req.params.siteId, session.id, toolInput.path, newPage, toolInput.message || 'Update page content via AI editor']
           );
-          console.log(`[replace_page_content] Saved to pending_edits: ${toolInput.path} (${newPage.length} chars)`);
-          return `Page content replaced successfully. New content (${toolInput.new_content.length} chars) inserted with header and footer preserved. Click "Preview Edits" to see changes.`;
+          const changeType = isTemplateFile ? 'Template updated — all pages will reflect this change' : 'Page body content updated';
+          console.log(`[replace_page_content] Saved to pending_edits: ${toolInput.path} (${newPage.length} chars) [template=${isTemplateFile}]`);
+          return `${changeType}. Click "Preview Edits" to see changes.`;
         } catch (dbError) {
           console.warn(`[replace_page_content] pending_edits not available, falling back to GitHub: ${dbError.message}`);
           const resp = await fetch(
