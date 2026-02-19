@@ -2391,6 +2391,68 @@ app.get('/sites/:siteId/pending-edits', async (req, res) => {
   }
 });
 
+// DELETE /sites/:siteId/pending-edits/:editId - Delete a specific pending edit
+app.delete('/sites/:siteId/pending-edits/:editId', async (req, res) => {
+  try {
+    const { siteId, editId } = req.params;
+    
+    // Verify site exists
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Delete the pending edit
+    const result = await pool.query(
+      'DELETE FROM pending_edits WHERE id = $1 AND site_id = $2 AND status = $3 RETURNING file_path',
+      [editId, siteId, 'pending']
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pending edit not found' });
+    }
+    
+    console.log(`[pending-edits] Deleted: ${result.rows[0].file_path}`);
+    res.json({ 
+      success: true, 
+      message: 'Pending edit deleted',
+      file_path: result.rows[0].file_path
+    });
+  } catch (error) {
+    console.error('Delete pending edit error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /sites/:siteId/pending-edits - Clear all pending edits for a site
+app.delete('/sites/:siteId/pending-edits', async (req, res) => {
+  try {
+    const { siteId } = req.params;
+    
+    // Verify site exists
+    const siteResult = await pool.query('SELECT * FROM sites WHERE id = $1', [siteId]);
+    if (siteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Delete all pending edits
+    const result = await pool.query(
+      'DELETE FROM pending_edits WHERE site_id = $1 AND status = $2 RETURNING file_path',
+      [siteId, 'pending']
+    );
+    
+    console.log(`[pending-edits] Cleared ${result.rows.length} pending edits for ${siteId}`);
+    res.json({ 
+      success: true, 
+      message: `Deleted ${result.rows.length} pending edit(s)`,
+      deleted: result.rows.map(r => r.file_path)
+    });
+  } catch (error) {
+    console.error('Clear pending edits error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /sites/:siteId/sync-staging - Reset staging branch to match main (production)
 app.post('/sites/:siteId/sync-staging', async (req, res) => {
   try {
