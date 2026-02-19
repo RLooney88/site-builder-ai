@@ -2787,7 +2787,7 @@ app.post('/sites/:siteId/publish', async (req, res) => {
       'Publish changes from staging to production'
     );
     
-    // Mark recent staging edits as published
+    // Mark recent staging edits as published (old system)
     await pool.query(
       `UPDATE edits 
        SET approved = true, deployed_at = NOW() 
@@ -2796,6 +2796,56 @@ app.post('/sites/:siteId/publish', async (req, res) => {
        AND approved = false`,
       [siteId]
     );
+    
+    // Handle pending_edits (new system for blog posts, etc.)
+    const pendingResult = await pool.query(
+      `SELECT id, file_path, content 
+       FROM pending_edits 
+       WHERE site_id = $1 AND status = 'pending'
+       ORDER BY created_at ASC`,
+      [siteId]
+    );
+    
+    if (pendingResult.rows.length > 0) {
+      console.log(`Publishing ${pendingResult.rows.length} pending edits to GitHub...`);
+      
+      for (const edit of pendingResult.rows) {
+        try {
+          // Upload file to GitHub main branch
+          const [owner, repo] = site.github_repo.split('/');
+          const uploadUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${edit.file_path}`;
+          
+          const uploadResponse = await fetch(uploadUrl, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${site.github_token}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'SiteBuilder-API'
+            },
+            body: JSON.stringify({
+              message: `Publish: ${edit.file_path}`,
+              content: Buffer.from(edit.content).toString('base64'),
+              branch: 'main'
+            })
+          });
+          
+          if (uploadResponse.ok) {
+            console.log(`  ✓ Published: ${edit.file_path}`);
+            
+            // Mark as deployed
+            await pool.query(
+              `UPDATE pending_edits SET status = 'deployed', updated_at = NOW() WHERE id = $1`,
+              [edit.id]
+            );
+          } else {
+            const error = await uploadResponse.json();
+            console.error(`  ✗ Failed to publish ${edit.file_path}:`, error.message);
+          }
+        } catch (err) {
+          console.error(`  ✗ Error publishing ${edit.file_path}:`, err.message);
+        }
+      }
+    }
     
     console.log(`Staging merged to main. Production deployment starting...`);
     
