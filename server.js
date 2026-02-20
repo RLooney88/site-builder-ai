@@ -2877,6 +2877,31 @@ app.post('/sites/:siteId/publish', async (req, res) => {
           const [owner, repo] = site.github_repo.split('/');
           const uploadUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${edit.file_path}`;
           
+          // If file already exists on main, GitHub requires SHA for updates
+          let existingSha = null;
+          try {
+            const getExisting = await fetch(`${uploadUrl}?ref=main`, {
+              headers: {
+                'Authorization': `Bearer ${site.github_token}`,
+                'User-Agent': 'SiteBuilder-API',
+                'Accept': 'application/vnd.github.v3+json'
+              }
+            });
+            if (getExisting.ok) {
+              const existingData = await getExisting.json();
+              existingSha = existingData.sha || null;
+            }
+          } catch (_) {
+            // best effort only
+          }
+
+          const payload = {
+            message: `Publish: ${edit.file_path}`,
+            content: Buffer.from(edit.content).toString('base64'),
+            branch: 'main'
+          };
+          if (existingSha) payload.sha = existingSha;
+
           const uploadResponse = await fetch(uploadUrl, {
             method: 'PUT',
             headers: {
@@ -2884,11 +2909,7 @@ app.post('/sites/:siteId/publish', async (req, res) => {
               'Content-Type': 'application/json',
               'User-Agent': 'SiteBuilder-API'
             },
-            body: JSON.stringify({
-              message: `Publish: ${edit.file_path}`,
-              content: Buffer.from(edit.content).toString('base64'),
-              branch: 'main'
-            })
+            body: JSON.stringify(payload)
           });
           
           if (uploadResponse.ok) {
