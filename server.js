@@ -2372,7 +2372,12 @@ app.get('/sites/:siteId/pending-edits', async (req, res) => {
     // Get all pending edits for this site
     try {
       const result = await pool.query(
-        'SELECT id, file_path, change_description, created_at FROM pending_edits WHERE site_id = $1 AND status = $2 ORDER BY created_at DESC',
+        `SELECT id, file_path, change_description, created_at
+         FROM pending_edits
+         WHERE site_id = $1
+           AND status = $2
+           AND file_path NOT IN ('dist/robots.txt', 'dist/sitemap.xml')
+         ORDER BY created_at DESC`,
         [siteId, 'pending']
       );
       
